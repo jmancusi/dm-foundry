@@ -43,9 +43,9 @@ async function hmacSha256Hex(secret, message) {
 async function post(event, body) {
   if (!setting(S.enabled)) return;
 
-  const endpoint   = (setting(S.endpoint) || "").replace(/\/$/, "");
+  const endpoint   = (setting(S.endpoint) || "").trim().replace(/\/+$/, "");
   const campaignId = setting(S.campaignId);
-  const secret     = setting(S.secret);
+  const secret     = (setting(S.secret) || "").trim();
 
   if (!endpoint || !campaignId || !secret) {
     warn(game.i18n.localize("DM_SYNC.Errors.NotConfigured"));
