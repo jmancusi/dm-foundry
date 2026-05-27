@@ -1,0 +1,20 @@
+{
+  "id": "dm-sync",
+  "title": "DM Campaign Prep Sync",
+  "description": "One-way sync of actors, journals, and combat events from FoundryVTT into the DM campaign-prep tool.",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "14"
+  },
+  "authors": [
+    { "name": "Jimmy" }
+  ],
+  "esmodules": ["scripts/main.js"],
+  "languages": [
+    { "lang": "en", "name": "English", "path": "lang/en.json" }
+  ],
+  "url": "",
+  "manifest": "",
+  "download": ""
+}

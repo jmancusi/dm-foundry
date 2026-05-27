@@ -1,0 +1,17 @@
+{
+  "DM_SYNC.Settings.Endpoint.Name": "Webhook endpoint",
+  "DM_SYNC.Settings.Endpoint.Hint": "The base URL of the DM prep tool, e.g. https://dm.rb/api/foundry",
+  "DM_SYNC.Settings.CampaignId.Name": "Campaign ID",
+  "DM_SYNC.Settings.CampaignId.Hint": "The numeric ID of the campaign in the DM prep tool this world maps to.",
+  "DM_SYNC.Settings.Secret.Name": "Shared secret",
+  "DM_SYNC.Settings.Secret.Hint": "HMAC secret shown on the campaign's Foundry sync section.",
+  "DM_SYNC.Settings.Enabled.Name": "Sync enabled",
+  "DM_SYNC.Settings.Enabled.Hint": "Master kill switch for outbound syncs.",
+  "DM_SYNC.Settings.SyncNpcs.Name": "Sync NPC-type actors",
+  "DM_SYNC.Settings.SyncNpcs.Hint": "If off, only character-type actors are synced.",
+  "DM_SYNC.FullSync.Confirm.Title": "Full Sync",
+  "DM_SYNC.FullSync.Confirm.Body": "Push every actor, NPC, and journal entry from this world to the DM prep tool?",
+  "DM_SYNC.FullSync.Done": "Synced {actors} actors and {journals} journals.",
+  "DM_SYNC.Errors.NotConfigured": "dm-sync is not fully configured. Set endpoint, campaign ID, and secret in module settings.",
+  "DM_SYNC.Errors.PostFailed": "dm-sync POST failed: {status}"
+}
