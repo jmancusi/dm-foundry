@@ -110,6 +110,7 @@ function journalPayload(j) {
     uuid:  j.uuid,
     name:  j.name,
     pages: (j.pages?.contents ?? []).map(p => ({
+      uuid:  p.uuid,
       title: p.name,
       text:  { content: p.text?.content ?? "" },
       type:  p.type,
