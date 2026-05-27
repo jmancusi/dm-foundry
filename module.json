@@ -14,7 +14,7 @@
   "languages": [
     { "lang": "en", "name": "English", "path": "lang/en.json" }
   ],
-  "url": "",
-  "manifest": "",
-  "download": ""
+  "url": "https://github.com/jmancusi/dm-foundry",
+  "manifest": "https://dm-foundry.thirdwheelgames.com/module.json",
+  "download": "https://github.com/jmancusi/dm-foundry/releases/latest/download/dm-sync.zip"
 }
