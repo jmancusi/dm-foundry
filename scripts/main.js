@@ -40,6 +40,7 @@ async function hmacSha256Hex(secret, message) {
     .join("");
 }
 
+// IMPORTANT: callers MUST NOT await this. It's fire-and-forget. See CLAUDE.md §0.
 async function post(event, body) {
   if (!setting(S.enabled)) return;
 
@@ -124,6 +125,39 @@ function shouldSyncActor(a) {
   return false;
 }
 
+function roleOf(actor) {
+  if (!actor) return "other";
+  if (actor.type === "character") return "pc";
+  if (actor.type === "npc")       return "npc";
+  return "monster";
+}
+
+// ---------------------------------------------------------------------------
+// Combat state helpers
+// ---------------------------------------------------------------------------
+
+// Per-actor cache of HP before the most recent update. Populated by preUpdateActor
+// and read by updateActor. Best-effort: a miss just suppresses a damage event.
+const hpCache = new Map();
+
+function activeCombat() {
+  return game.combats?.active ?? null;
+}
+
+function activeCombatantActor() {
+  return activeCombat()?.combatant?.actor ?? null;
+}
+
+function combatParticipantsSnapshot(combat) {
+  return (combat.combatants?.contents ?? []).map(c => ({
+    foundry_actor_uuid: c.actor?.uuid ?? null,
+    display_name:       c.name,
+    role:               roleOf(c.actor),
+    initiative:         c.initiative,
+    max_hp:             c.actor?.system?.attributes?.hp?.max ?? null,
+  })).filter(p => p.foundry_actor_uuid);
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -172,27 +206,119 @@ Hooks.once("init", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Hooks
+// Actor hooks
 // ---------------------------------------------------------------------------
+
+// preUpdateActor: stash old HP. Zero network, just a Map write. Synchronous.
+Hooks.on("preUpdateActor", (actor) => {
+  const hp = actor.system?.attributes?.hp?.value;
+  if (typeof hp === "number") {
+    hpCache.set(actor.uuid, hp);
+  }
+});
 
 Hooks.on("createActor", (a) => {
   if (!shouldSyncActor(a)) return;
   post("actor", actorPayload(a));
 });
-Hooks.on("updateActor", (a) => {
-  if (!shouldSyncActor(a)) return;
-  post("actor", actorPayload(a));
+
+Hooks.on("updateActor", (a, change) => {
+  if (shouldSyncActor(a)) {
+    post("actor", actorPayload(a));
+  }
+
+  // HP delta → combat damage / healing event when a combat is active.
+  const newHp = change?.system?.attributes?.hp?.value;
+  if (typeof newHp !== "number") return;
+  const oldHp = hpCache.get(a.uuid);
+  hpCache.delete(a.uuid); // consume the cached value either way
+  if (typeof oldHp !== "number") return; // miss = suppress (best-effort rule)
+
+  const delta = oldHp - newHp;
+  if (delta === 0) return;
+
+  const combat = activeCombat();
+  if (!combat) return;
+
+  const attacker = activeCombatantActor();
+  const isDamage = delta > 0;
+  post("combat", {
+    uuid:          combat.uuid,
+    event:         isDamage ? "damage" : "healing",
+    attacker_uuid: attacker?.uuid ?? null,
+    target_uuid:   a.uuid,
+    target_name:   a.name,
+    attacker_name: attacker?.name ?? null,
+    amount:        Math.abs(delta),
+    hp_before:     oldHp,
+    hp_after:      newHp,
+    killed:        isDamage && oldHp > 0 && newHp <= 0,
+    round:         combat.round,
+    turn:          combat.turn,
+    occurred_at:   Date.now(),
+  });
 });
+
 Hooks.on("deleteActor", (a) => {
   if (!shouldSyncActor(a)) return;
   post("actor", { uuid: a.uuid, type: a.type, deleted: true });
 });
 
+// ---------------------------------------------------------------------------
+// Journal hooks
+// ---------------------------------------------------------------------------
+
 Hooks.on("createJournalEntry", (j) => post("journal", journalPayload(j)));
 Hooks.on("updateJournalEntry", (j) => post("journal", journalPayload(j)));
 
-Hooks.on("combatStart",  (c) => post("combat", { uuid: c.uuid, event: "start", scene: c.scene?.name }));
-Hooks.on("deleteCombat", (c) => post("combat", { uuid: c.uuid, event: "end" }));
+// ---------------------------------------------------------------------------
+// Combat hooks
+// ---------------------------------------------------------------------------
+
+Hooks.on("combatStart", (c) => {
+  post("combat", {
+    uuid:         c.uuid,
+    event:        "start",
+    scene:        c.scene?.name,
+    participants: combatParticipantsSnapshot(c),
+  });
+});
+
+Hooks.on("deleteCombat", (c) => {
+  post("combat", { uuid: c.uuid, event: "end" });
+});
+
+// Narrative kill: DM marks combatant defeated without HP hitting 0.
+// Synthesize a damage event for the remaining HP, credit the active combatant.
+Hooks.on("updateCombatant", (combatant, change) => {
+  if (change?.defeated !== true) return;
+  const combat = combatant.parent;
+  if (!combat?.started) return;
+
+  const target = combatant.actor;
+  const currentHp = target?.system?.attributes?.hp?.value ?? null;
+  if (typeof currentHp !== "number" || currentHp <= 0) {
+    return; // already 0 or unknown — normal flow handled it
+  }
+
+  const attacker = activeCombatantActor();
+  post("combat", {
+    uuid:          combat.uuid,
+    event:         "damage",
+    attacker_uuid: attacker?.uuid ?? null,
+    target_uuid:   target?.uuid ?? null,
+    target_name:   combatant.name,
+    attacker_name: attacker?.name ?? null,
+    amount:        currentHp,
+    hp_before:     currentHp,
+    hp_after:      0,
+    killed:        true,
+    synthetic:     true,
+    round:         combat.round,
+    turn:          combat.turn,
+    occurred_at:   Date.now(),
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Full Sync (exposed as a global; the GM wires it to a macro)
