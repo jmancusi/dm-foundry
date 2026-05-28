@@ -148,6 +148,13 @@ function activeCombatantActor() {
   return activeCombat()?.combatant?.actor ?? null;
 }
 
+function actorSourceUuid(actor) {
+  if (!actor) return null;
+  return actor.getFlag?.("core", "sourceId")
+      ?? actor._stats?.compendiumSource
+      ?? null;
+}
+
 function combatParticipantsSnapshot(combat) {
   return (combat.combatants?.contents ?? []).map(c => ({
     foundry_actor_uuid: c.actor?.uuid ?? null,
@@ -155,6 +162,8 @@ function combatParticipantsSnapshot(combat) {
     role:               roleOf(c.actor),
     initiative:         c.initiative,
     max_hp:             c.actor?.system?.attributes?.hp?.max ?? null,
+    source_uuid:        actorSourceUuid(c.actor),
+    img:                c.actor?.img ?? null,
   })).filter(p => p.foundry_actor_uuid);
 }
 
@@ -243,19 +252,21 @@ Hooks.on("updateActor", (a, change) => {
   const attacker = activeCombatantActor();
   const isDamage = delta > 0;
   post("combat", {
-    uuid:          combat.uuid,
-    event:         isDamage ? "damage" : "healing",
-    attacker_uuid: attacker?.uuid ?? null,
-    target_uuid:   a.uuid,
-    target_name:   a.name,
-    attacker_name: attacker?.name ?? null,
-    amount:        Math.abs(delta),
-    hp_before:     oldHp,
-    hp_after:      newHp,
-    killed:        isDamage && oldHp > 0 && newHp <= 0,
-    round:         combat.round,
-    turn:          combat.turn,
-    occurred_at:   Date.now(),
+    uuid:               combat.uuid,
+    event:              isDamage ? "damage" : "healing",
+    attacker_uuid:      attacker?.uuid ?? null,
+    target_uuid:        a.uuid,
+    target_name:        a.name,
+    target_source_uuid: actorSourceUuid(a),
+    target_img:         a.img ?? null,
+    attacker_name:      attacker?.name ?? null,
+    amount:             Math.abs(delta),
+    hp_before:          oldHp,
+    hp_after:           newHp,
+    killed:             isDamage && oldHp > 0 && newHp <= 0,
+    round:              combat.round,
+    turn:               combat.turn,
+    occurred_at:        Date.now(),
   });
 });
 
@@ -303,20 +314,106 @@ Hooks.on("updateCombatant", (combatant, change) => {
 
   const attacker = activeCombatantActor();
   post("combat", {
-    uuid:          combat.uuid,
-    event:         "damage",
-    attacker_uuid: attacker?.uuid ?? null,
-    target_uuid:   target?.uuid ?? null,
-    target_name:   combatant.name,
-    attacker_name: attacker?.name ?? null,
-    amount:        currentHp,
-    hp_before:     currentHp,
-    hp_after:      0,
-    killed:        true,
-    synthetic:     true,
-    round:         combat.round,
-    turn:          combat.turn,
-    occurred_at:   Date.now(),
+    uuid:               combat.uuid,
+    event:              "damage",
+    attacker_uuid:      attacker?.uuid ?? null,
+    target_uuid:        target?.uuid ?? null,
+    target_name:        combatant.name,
+    target_source_uuid: actorSourceUuid(target),
+    target_img:         target?.img ?? null,
+    attacker_name:      attacker?.name ?? null,
+    amount:             currentHp,
+    hp_before:          currentHp,
+    hp_after:           0,
+    killed:             true,
+    synthetic:          true,
+    round:              combat.round,
+    turn:               combat.turn,
+    occurred_at:        Date.now(),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dice roll hooks
+// ---------------------------------------------------------------------------
+
+// Classify a chat message's roll into a (type, subtype) pair. Works best on dnd5e;
+// other systems gracefully degrade to {type: "other"}.
+function classifyRoll(msg) {
+  const flag = msg.flags?.dnd5e?.roll;
+  if (!flag) return { type: "other", subtype: null };
+  return {
+    type:    flag.type ?? "other",
+    subtype: flag.ability ?? flag.skillId ?? flag.tool ?? null,
+  };
+}
+
+// Extract the chosen d20 face from a Roll, including advantage/disadvantage mode
+// and the discarded face when present. Returns null when the roll has no d20 term.
+function extractD20(roll) {
+  const d20Term = (roll?.dice ?? []).find(d => d.faces === 20);
+  if (!d20Term) return null;
+
+  const results = d20Term.results ?? [];
+  const active  = results.find(r => r.active) ?? results[0];
+  const all     = results.map(r => r.result);
+
+  const mods = d20Term.modifiers ?? [];
+  const hasKh = mods.some(m => typeof m === "string" && m.includes("kh"));
+  const hasKl = mods.some(m => typeof m === "string" && m.includes("kl"));
+  const advantage_mode = hasKh ? "advantage" : hasKl ? "disadvantage" : "normal";
+
+  let d20_other = null;
+  if (results.length > 1) {
+    const other = results.find(r => !r.active);
+    d20_other = other?.result ?? null;
+  }
+
+  return {
+    d20:    active?.result ?? null,
+    d20_other,
+    advantage_mode,
+  };
+}
+
+Hooks.on("createChatMessage", (msg) => {
+  if (msg.flags?.dm_sync_ignore === true) return;
+  if (!msg.rolls?.length) return;
+
+  const { type, subtype } = classifyRoll(msg);
+  const actor   = ChatMessage.getSpeakerActor?.(msg.speaker) ?? null;
+  const combat  = activeCombat();
+  const round   = combat?.round ?? null;
+  const turn    = combat?.turn  ?? null;
+  const targetUuids = Array.from(msg.flags?.dnd5e?.targets ?? [])
+    .map(t => t?.uuid)
+    .filter(Boolean);
+
+  msg.rolls.forEach((roll, idx) => {
+    try {
+      const d20 = extractD20(roll);
+      post("roll", {
+        uuid:           msg.uuid ?? msg.id,
+        roll_index:     idx,
+        actor_uuid:     actor?.uuid ?? null,
+        actor_name:     msg.speaker?.alias ?? actor?.name ?? "Unknown",
+        type,
+        subtype,
+        formula:        roll.formula ?? "",
+        total:          Number(roll.total ?? 0),
+        d20:            d20?.d20 ?? null,
+        d20_other:      d20?.d20_other ?? null,
+        advantage_mode: d20?.advantage_mode ?? null,
+        is_nat_20:      d20?.d20 === 20,
+        is_nat_1:       d20?.d20 === 1,
+        target_uuids:   targetUuids.length ? targetUuids : null,
+        round,
+        turn,
+        occurred_at:    Date.now(),
+      });
+    } catch (err) {
+      warn(`roll extract failed: ${err.message}`);
+    }
   });
 });
 
