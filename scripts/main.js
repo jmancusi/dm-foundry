@@ -140,6 +140,16 @@ function roleOf(actor) {
 // and read by updateActor. Best-effort: a miss just suppresses a damage event.
 const hpCache = new Map();
 
+// Per-actor pending attribution from a recent dnd5e.applyDamage hook fire.
+// Keyed by actor.uuid → {attack_id, originatingMessage, fired_at}. updateActor
+// reads this to attach attack_id + attributed_by="click" to the damage event.
+// Entries older than 2s are stale and ignored (auto-cleaned on next read).
+const pendingApply = new Map();
+
+// Set of attack_ids we've already POSTed in this session, to avoid double-posting
+// when the same usage card is read multiple times.
+const postedAttacks = new Set();
+
 function activeCombat() {
   return game.combats?.active ?? null;
 }
@@ -249,17 +259,19 @@ Hooks.on("updateActor", (a, change) => {
   const combat = activeCombat();
   if (!combat) return;
 
-  const attacker = activeCombatantActor();
+  // Check for a recent applyDamage hook fire that we should attribute to.
+  const attribution = consumePendingApply(a.uuid);
   const isDamage = delta > 0;
-  post("combat", {
+
+  const payload = {
     uuid:               combat.uuid,
     event:              isDamage ? "damage" : "healing",
-    attacker_uuid:      attacker?.uuid ?? null,
+    attacker_uuid:      attribution?.actor_uuid ?? activeCombatantActor()?.uuid ?? null,
     target_uuid:        a.uuid,
     target_name:        a.name,
     target_source_uuid: actorSourceUuid(a),
     target_img:         a.img ?? null,
-    attacker_name:      attacker?.name ?? null,
+    attacker_name:      attribution?.actor_name ?? activeCombatantActor()?.name ?? null,
     amount:             Math.abs(delta),
     hp_before:          oldHp,
     hp_after:           newHp,
@@ -267,7 +279,26 @@ Hooks.on("updateActor", (a, change) => {
     round:              combat.round,
     turn:               combat.turn,
     occurred_at:        Date.now(),
-  });
+  };
+
+  if (attribution) {
+    payload.attack_id     = attribution.attack_id;
+    payload.attributed_by = "click";
+    if (attribution.damage_type_breakdown) {
+      payload.damage_type_breakdown = attribution.damage_type_breakdown;
+    }
+  } else {
+    // No applyDamage hook fired — try heuristic match for direct HP edits.
+    const heuristic = heuristicMatch(a.uuid);
+    if (heuristic) {
+      payload.attack_id     = heuristic.attack_id;
+      payload.attributed_by = "heuristic";
+    } else {
+      payload.attributed_by = "none";
+    }
+  }
+
+  post("combat", payload);
 });
 
 Hooks.on("deleteActor", (a) => {
@@ -337,14 +368,22 @@ Hooks.on("updateCombatant", (combatant, change) => {
 // Dice roll hooks
 // ---------------------------------------------------------------------------
 
-// Classify a chat message's roll into a (type, subtype) pair. Works best on dnd5e;
-// other systems gracefully degrade to {type: "other"}.
+// Classify a chat message's roll. Reads dnd5e flags for type/subtype/item/activity
+// context. Also picks up dm-sync helper flags when present (macro path).
 function classifyRoll(msg) {
-  const flag = msg.flags?.dnd5e?.roll;
-  if (!flag) return { type: "other", subtype: null };
+  const dnd5e = msg.flags?.dnd5e ?? {};
+  const dmSync = msg.flags?.[MODULE_ID]?.attack ?? null;
+
   return {
-    type:    flag.type ?? "other",
-    subtype: flag.ability ?? flag.skillId ?? flag.tool ?? null,
+    type:    dnd5e.roll?.type ?? (dmSync ? "damage" : "other"),
+    subtype: dnd5e.roll?.ability ?? dnd5e.roll?.skillId ?? dnd5e.roll?.tool ?? null,
+
+    item_uuid:              dnd5e.item?.uuid ?? null,
+    item_name:              null, // populated from item document lookup if needed
+    activity_uuid:          dnd5e.activity?.uuid ?? null,
+    originating_message_id: dnd5e.originatingMessage ?? msg.id ?? null,
+    attack_id:              dmSync?.attack_id
+      ?? (dnd5e.originatingMessage ? `native:${dnd5e.originatingMessage}` : null),
   };
 }
 
@@ -378,9 +417,23 @@ function extractD20(roll) {
 
 Hooks.on("createChatMessage", (msg) => {
   if (msg.flags?.dm_sync_ignore === true) return;
+
+  const meta = classifyRoll(msg);
+
+  // For native damage/healing messages with an activity, synthesize an attack
+  // event ONCE per originating message so Laravel has the parent record by the
+  // time the apply click sends a damage event.
+  if ((meta.type === "damage" || meta.type === "healing")
+      && meta.activity_uuid
+      && meta.attack_id
+      && !msg.flags?.[MODULE_ID]?.attack
+      && !postedAttacks.has(meta.attack_id)) {
+    postedAttacks.add(meta.attack_id);
+    postNativeAttack(msg, meta);
+  }
+
   if (!msg.rolls?.length) return;
 
-  const { type, subtype } = classifyRoll(msg);
   const actor   = ChatMessage.getSpeakerActor?.(msg.speaker) ?? null;
   const combat  = activeCombat();
   const round   = combat?.round ?? null;
@@ -393,29 +446,353 @@ Hooks.on("createChatMessage", (msg) => {
     try {
       const d20 = extractD20(roll);
       post("roll", {
-        uuid:           msg.uuid ?? msg.id,
-        roll_index:     idx,
-        actor_uuid:     actor?.uuid ?? null,
-        actor_name:     msg.speaker?.alias ?? actor?.name ?? "Unknown",
-        type,
-        subtype,
-        formula:        roll.formula ?? "",
-        total:          Number(roll.total ?? 0),
-        d20:            d20?.d20 ?? null,
-        d20_other:      d20?.d20_other ?? null,
-        advantage_mode: d20?.advantage_mode ?? null,
-        is_nat_20:      d20?.d20 === 20,
-        is_nat_1:       d20?.d20 === 1,
-        target_uuids:   targetUuids.length ? targetUuids : null,
+        uuid:                   msg.uuid ?? msg.id,
+        roll_index:             idx,
+        actor_uuid:             actor?.uuid ?? null,
+        actor_name:             msg.speaker?.alias ?? actor?.name ?? "Unknown",
+        type:                   meta.type,
+        subtype:                meta.subtype,
+        item_uuid:              meta.item_uuid,
+        item_name:              meta.item_name,
+        activity_uuid:          meta.activity_uuid,
+        originating_message_id: meta.originating_message_id,
+        attack_id:              meta.attack_id,
+        formula:                roll.formula ?? "",
+        total:                  Number(roll.total ?? 0),
+        d20:                    d20?.d20 ?? null,
+        d20_other:              d20?.d20_other ?? null,
+        advantage_mode:         d20?.advantage_mode ?? null,
+        is_nat_20:              d20?.d20 === 20,
+        is_nat_1:               d20?.d20 === 1,
+        target_uuids:           targetUuids.length ? targetUuids : null,
         round,
         turn,
-        occurred_at:    Date.now(),
+        occurred_at:            Date.now(),
       });
     } catch (err) {
       warn(`roll extract failed: ${err.message}`);
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Attack tracking: native + helper
+// ---------------------------------------------------------------------------
+
+// Recent attacks for heuristic fallback when DM edits HP directly without
+// going through any Apply button. Per-actor ring of {attack_id, target_uuids,
+// posted_at, speaker_user_id}. Entries older than 120s are dropped.
+const recentAttacks = [];
+const HEURISTIC_WINDOW_MS = 120_000;
+
+function rememberAttack(attack) {
+  recentAttacks.push({
+    attack_id:     attack.attack_id,
+    target_uuids:  attack.target_uuids ?? [],
+    posted_at:     Date.now(),
+    actor_uuid:    attack.actor_uuid,
+  });
+  // Trim oldest entries
+  const cutoff = Date.now() - HEURISTIC_WINDOW_MS;
+  while (recentAttacks.length && recentAttacks[0].posted_at < cutoff) {
+    recentAttacks.shift();
+  }
+}
+
+function heuristicMatch(targetActorUuid) {
+  const cutoff = Date.now() - HEURISTIC_WINDOW_MS;
+  // Most recent attack whose targets include this actor.
+  for (let i = recentAttacks.length - 1; i >= 0; i--) {
+    const a = recentAttacks[i];
+    if (a.posted_at < cutoff) continue;
+    if (a.target_uuids.includes(targetActorUuid)) return a;
+  }
+  // Loose fallback: any recent attack regardless of target (DM might've
+  // targeted a different token than the player marked).
+  const recent = recentAttacks[recentAttacks.length - 1];
+  return (recent && recent.posted_at >= cutoff) ? recent : null;
+}
+
+function consumePendingApply(actorUuid) {
+  const entry = pendingApply.get(actorUuid);
+  if (!entry) return null;
+  pendingApply.delete(actorUuid);
+  // Stale entry — ignore (the hook fired for a different update cycle).
+  if (Date.now() - entry.fired_at > 2000) return null;
+  return entry;
+}
+
+// Build and POST an attack event synthesized from a native dnd5e damage roll
+// message. Called once per (originatingMessage, activity.uuid) pair.
+function postNativeAttack(msg, meta) {
+  const actor   = ChatMessage.getSpeakerActor?.(msg.speaker) ?? null;
+  const combat  = activeCombat();
+  const targets = Array.from(msg.flags?.dnd5e?.targets ?? [])
+    .map(t => t?.uuid)
+    .filter(Boolean);
+
+  // Aggregate roll totals into a single component (we don't know the per-type
+  // breakdown from a chat message alone — dnd5e bundles types into Roll terms).
+  const total = (msg.rolls ?? []).reduce((sum, r) => sum + Number(r.total ?? 0), 0);
+
+  const itemName = msg.flags?.dnd5e?.item?.uuid
+    ? fromUuidSync?.(msg.flags.dnd5e.item.uuid)?.name ?? null
+    : null;
+
+  const payload = {
+    attack_id:              meta.attack_id,
+    foundry_combat_uuid:    combat?.uuid ?? null,
+    actor_uuid:             actor?.uuid ?? null,
+    actor_name:             msg.speaker?.alias ?? actor?.name ?? "Unknown",
+    source_label:           itemName ?? "Native attack",
+    source_kind:            "native",
+    item_uuid:              meta.item_uuid,
+    item_name:              itemName,
+    activity_uuid:          meta.activity_uuid,
+    originating_message_id: meta.originating_message_id,
+    components: [{
+      label: itemName ?? "Damage",
+      type:  inferDamageType(msg) ?? "none",
+      amount: total,
+    }],
+    total,
+    kind:                   meta.type === "healing" ? "healing" : "damage",
+    target_uuids:           targets,
+    crit:                   !!msg.flags?.dnd5e?.roll?.critical,
+    round:                  combat?.round ?? null,
+    turn:                   combat?.turn ?? null,
+    occurred_at:            Date.now(),
+  };
+
+  rememberAttack(payload);
+  post("attack", payload);
+}
+
+// Best-effort damage type from the first roll's options.type (dnd5e v5+).
+function inferDamageType(msg) {
+  const first = msg.rolls?.[0];
+  return first?.options?.type ?? null;
+}
+
+// dnd5e.applyDamage fires when actor.applyDamage runs (native tray AND our
+// macro Apply buttons that call the same method). Stash attribution by target
+// actor uuid; updateActor consumes within a 2s window.
+Hooks.on("dnd5e.applyDamage", (actor, amount, options) => {
+  const msgId = options?.originatingMessage;
+  const msg   = msgId ? game.messages.get(msgId) : null;
+  if (!msg) return;
+
+  const dmSyncAttack = msg.flags?.[MODULE_ID]?.attack;
+  const activityUuid = msg.flags?.dnd5e?.activity?.uuid;
+  const originating  = msg.flags?.dnd5e?.originatingMessage ?? msg.id;
+
+  const attack_id = dmSyncAttack?.attack_id
+                 ?? (activityUuid ? `native:${originating}` : null);
+  if (!attack_id) return;
+
+  pendingApply.set(actor.uuid, {
+    attack_id,
+    actor_uuid:               dmSyncAttack?.actor_uuid ?? msg.speaker?.actor ?? null,
+    actor_name:               dmSyncAttack?.actor_name ?? msg.speaker?.alias ?? null,
+    damage_type_breakdown:    deriveBreakdown(dmSyncAttack, amount),
+    fired_at:                 Date.now(),
+  });
+});
+
+function deriveBreakdown(dmSyncAttack, amount) {
+  if (!dmSyncAttack?.components) return null;
+  // Sum components per damage type, then proportionally scale to the actual
+  // amount applied (handles Half-damage / resistances).
+  const byType = {};
+  for (const c of dmSyncAttack.components) {
+    byType[c.type] = (byType[c.type] || 0) + Number(c.amount ?? 0);
+  }
+  const total = Object.values(byType).reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+  const scale = amount / total;
+  return Object.entries(byType).map(([type, amt]) => ({
+    type,
+    amount: Math.round(amt * scale),
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Render hook: inject Apply buttons on macro chat cards
+// ---------------------------------------------------------------------------
+
+Hooks.on("renderChatMessage", (msg, html /* , data */) => {
+  // Only GMs see Apply buttons (matches native behavior).
+  if (!game.user.isGM) return;
+
+  const attack = msg.flags?.[MODULE_ID]?.attack;
+  if (!attack) return;
+
+  // Avoid double-injection on re-renders.
+  const root = html?.[0] ?? html;
+  if (root.querySelector?.("[data-action='dmSyncApplyDamage']")) return;
+
+  const kind = attack.kind === "healing" ? "healing" : "damage";
+  const buttons = kind === "healing"
+    ? [{ label: "Apply Healing", multiplier: -1 }]
+    : [
+        { label: "Apply Full",  multiplier: 1 },
+        { label: "Apply Half",  multiplier: 0.5 },
+        { label: "Apply None",  multiplier: 0 },
+      ];
+
+  const container = document.createElement("div");
+  container.className = "dm-sync-apply-buttons";
+  container.style.cssText = "display:flex; gap:6px; padding:6px 4px; border-top:1px solid #ddd; margin-top:6px;";
+
+  for (const b of buttons) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.dataset.action = "dmSyncApplyDamage";
+    btn.dataset.multiplier = String(b.multiplier);
+    btn.dataset.messageId = msg.id;
+    btn.textContent = b.label;
+    btn.style.cssText = "flex:1; padding:4px 6px; font-size:11px;";
+    btn.addEventListener("click", () => handleApplyClick(msg, b.multiplier));
+    container.appendChild(btn);
+  }
+
+  const cardContent = root.querySelector?.(".chat-card") ?? root.querySelector?.(".message-content") ?? root;
+  cardContent.appendChild?.(container);
+});
+
+async function handleApplyClick(msg, multiplier) {
+  const attack = msg.flags?.[MODULE_ID]?.attack;
+  if (!attack) return;
+
+  // Target resolution: prefer GM's currently selected/targeted tokens, fall
+  // back to the targets stamped on the attack at fire time.
+  let targets = Array.from(game.user.targets ?? []).map(t => t.actor).filter(Boolean);
+  if (!targets.length) {
+    targets = (attack.target_uuids ?? [])
+      .map(uuid => fromUuidSync?.(uuid))
+      .filter(a => a && a.system?.attributes?.hp);
+  }
+  if (!targets.length) {
+    ui.notifications?.warn(`[${MODULE_ID}] No target selected to apply damage to.`);
+    return;
+  }
+
+  const base = Number(attack.total ?? 0);
+  const amount = Math.round(base * multiplier);
+  if (amount === 0) return;
+
+  const damageType = attack.components?.[0]?.type ?? "none";
+
+  for (const actor of targets) {
+    try {
+      // Route through dnd5e's applyDamage so the dnd5e.applyDamage hook fires;
+      // our hook subscriber stashes pendingApply, and updateActor attaches it.
+      // The negative multiplier flag (-1 for healing) inverts via dnd5e.
+      const damages = [{ value: Math.abs(amount), type: damageType }];
+      await actor.applyDamage(damages, {
+        multiplier:         multiplier < 0 ? -1 : 1,
+        originatingMessage: msg.id,
+      });
+    } catch (err) {
+      warn(`applyDamage failed for ${actor.name}: ${err.message}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public helper API: dmSync.attackMessage, dmSync.attack
+// ---------------------------------------------------------------------------
+
+/**
+ * Stamp dm-sync flags + POST an attack event + create the chat message.
+ * Replaces ChatMessage.create() in player macros. Returns {attack_id, message}.
+ *
+ * Required: source (string), total (number), components ([{label,type,amount}]),
+ *           message ({content, rolls, speaker, sound, ...} for ChatMessage.create).
+ * Optional: kind ("damage"|"healing", default "damage"),
+ *           targets (array of actor uuids; defaults to game.user.targets snapshot),
+ *           crit (bool, default false),
+ *           attack_id (string, default randomID()).
+ */
+async function attackMessage(opts) {
+  const flagPayload = buildAttackFlag(opts);
+
+  const messageData = {
+    ...(opts.message ?? {}),
+    flags: {
+      ...(opts.message?.flags ?? {}),
+      [MODULE_ID]: {
+        ...(opts.message?.flags?.[MODULE_ID] ?? {}),
+        attack: flagPayload,
+      },
+    },
+  };
+
+  const created = await ChatMessage.create(messageData);
+  postHelperAttack(flagPayload, created?.id);
+
+  return { attack_id: flagPayload.attack_id, message: created };
+}
+
+/**
+ * Return the flags object for macros that need to keep their own
+ * ChatMessage.create call. Also POSTs the attack event.
+ */
+function attack(opts) {
+  const flagPayload = buildAttackFlag(opts);
+  postHelperAttack(flagPayload, null);
+  return {
+    attack_id: flagPayload.attack_id,
+    flags: { [MODULE_ID]: { attack: flagPayload } },
+  };
+}
+
+function buildAttackFlag(opts) {
+  const targets = opts.targets ?? Array.from(game.user.targets ?? [])
+    .map(t => t.actor?.uuid)
+    .filter(Boolean);
+
+  const speakerActor = ChatMessage.getSpeakerActor?.(opts.message?.speaker ?? ChatMessage.getSpeaker());
+
+  return {
+    attack_id:    opts.attack_id ?? foundry.utils.randomID(),
+    source:       String(opts.source ?? "Unknown"),
+    total:        Number(opts.total ?? 0),
+    components:   Array.isArray(opts.components) ? opts.components : [],
+    kind:         opts.kind === "healing" ? "healing" : "damage",
+    target_uuids: targets,
+    crit:         !!opts.crit,
+    actor_uuid:   speakerActor?.uuid ?? null,
+    actor_name:   speakerActor?.name ?? null,
+  };
+}
+
+function postHelperAttack(flagPayload, createdMessageId) {
+  const combat = activeCombat();
+  const payload = {
+    attack_id:              flagPayload.attack_id,
+    foundry_combat_uuid:    combat?.uuid ?? null,
+    actor_uuid:             flagPayload.actor_uuid,
+    actor_name:             flagPayload.actor_name ?? "Unknown",
+    source_label:           flagPayload.source,
+    source_kind:            "macro",
+    item_uuid:              null,
+    item_name:              null,
+    activity_uuid:          null,
+    originating_message_id: createdMessageId,
+    components:             flagPayload.components,
+    total:                  flagPayload.total,
+    kind:                   flagPayload.kind,
+    target_uuids:           flagPayload.target_uuids,
+    crit:                   flagPayload.crit,
+    round:                  combat?.round ?? null,
+    turn:                   combat?.turn ?? null,
+    occurred_at:            Date.now(),
+  };
+
+  rememberAttack(payload);
+  post("attack", payload);
+}
 
 // ---------------------------------------------------------------------------
 // Full Sync (exposed as a global; the GM wires it to a macro)
@@ -443,5 +820,9 @@ async function fullSync() {
 
 Hooks.once("ready", () => {
   log(`ready v${game.modules.get(MODULE_ID)?.version ?? "?"}`);
-  globalThis.dmSync = { fullSync };
+  globalThis.dmSync = {
+    fullSync,
+    attackMessage,
+    attack,
+  };
 });

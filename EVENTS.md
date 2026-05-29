@@ -2,7 +2,7 @@
 
 What the `dm-sync` FoundryVTT module captures from a live world and how it ships to the Laravel side. This file is the source of truth when planning new features — read it before deciding what extra signals to add.
 
-Last updated for module **v0.2.0**.
+Last updated for module **v0.3.0**.
 
 ## Module settings
 
@@ -38,6 +38,7 @@ Idempotency keys are documented per event below; resending the same payload is a
 | `POST /journal` | journal created / updated | `(campaign_id, uuid)` — upsert |
 | `POST /combat` | combat start, combat end, HP delta during combat, narrative kill | `start`/`end`: by combat uuid; damage/healing: append-only |
 | `POST /roll` | any chat message containing rolls | `(campaign_id, uuid, roll_index)` |
+| `POST /attack` | helper call (`dmSync.attackMessage()` / `dmSync.attack()`) OR auto-synthesized once per native dnd5e damage/healing roll with `flags.dnd5e.activity` | `(campaign_id, attack_id)` — upsert |
 | `POST /full-sync` | manual macro (`dmSync.fullSync()`) | upserts all actors + journals |
 
 ## Hooks listened to
@@ -57,7 +58,9 @@ In source order (`scripts/main.js`). The `Posts?` column flags which hooks actua
 | `combatStart` | Yes | `POST /combat` with `event=start`, scene name, participants snapshot. |
 | `deleteCombat` | Yes | `POST /combat` with `event=end`. |
 | `updateCombatant` (defeated=true) | Yes | `POST /combat` with `event=damage`, `synthetic=true`, `killed=true`, amount = current HP. Skipped if current HP ≤ 0 (normal HP path already covered it). |
-| `createChatMessage` | Yes | One `POST /roll` per Roll in the chat message. Skipped if `msg.flags.dm_sync_ignore === true`. |
+| `createChatMessage` | Yes | One `POST /roll` per Roll in the chat message (enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`). For native damage/healing rolls with a dnd5e `activity` flag, also auto-synthesizes one `POST /attack` per `(originatingMessage, activity)` pair. Skipped if `msg.flags.dm_sync_ignore === true`. |
+| `renderChatMessage` | No | GM-only: injects Apply Full/Half/None (or Apply Healing) buttons onto chat cards stamped with `flags["dm-sync"].attack` (the macro path). Native cards already get dnd5e's built-in `<damage-application>` tray. |
+| `dnd5e.applyDamage` | Yes (indirectly) | Captures `(target_actor_uuid → attack_id)` into a 2s pendingApply map when the GM clicks Apply on a native or macro card. The subsequent `updateActor` event reads this and stamps `attack_id` + `attributed_by="click"` on its `POST /combat` damage event. |
 
 ## Actor filter rules
 
@@ -254,6 +257,75 @@ Fires on any `createChatMessage` whose `msg.rolls` array is non-empty. One POST 
 
 **Escape hatch:** any chat message with `msg.flags.dm_sync_ignore === true` is skipped. Useful for DM-side admin macros that shouldn't pollute stats.
 
+### Attack payload (`POST /attack`)
+
+Introduced in v0.3.0. One event per discrete "attack" — captures the source item/skill/spell and a component-level breakdown of damage so the Laravel side can attribute HP changes to a specific cause. Idempotent on `(campaign_id, attack_id)`.
+
+Two paths produce this event:
+
+1. **Helper (macro)** — `dmSync.attackMessage({...})` or `dmSync.attack({...})`. Players add one call to their existing macros.
+2. **Auto-synthesized (native)** — when a dnd5e damage or healing chat message lands with `flags.dnd5e.activity` populated, the module synthesizes one attack event per `(originatingMessage, activity)` pair. No player change required for native sheet attacks.
+
+```json
+{
+  "attack_id":              "atk_abc123",
+  "foundry_combat_uuid":    "Combat.xyz",
+  "actor_uuid":             "Actor.bren",
+  "actor_name":             "Bren",
+  "source_label":           "Longbow + Hunter's Mark + Dreadful Strike",
+  "source_kind":            "macro",
+  "item_uuid":              null,
+  "item_name":              null,
+  "activity_uuid":          null,
+  "originating_message_id": "msg_def456",
+  "components": [
+    { "label": "Longbow",          "type": "piercing", "amount": 12 },
+    { "label": "Hunter's Mark",    "type": "piercing", "amount": 5  },
+    { "label": "Dreadful Strike",  "type": "psychic",  "amount": 9  }
+  ],
+  "total":        26,
+  "kind":         "damage",
+  "target_uuids": ["Actor.gob1"],
+  "crit":         false,
+  "round":        2,
+  "turn":         1,
+  "occurred_at":  1735776000000
+}
+```
+
+For native dnd5e attacks the same shape comes from the auto-synthesizer:
+- `source_kind: "native"`
+- `item_uuid` and `activity_uuid` populated from `flags.dnd5e.{item,activity}.uuid`
+- `attack_id` deterministically derived: `"native:<originatingMessageId>"`
+- `components` collapsed to a single entry (the chat message doesn't expose per-type breakdowns of the bundled roll; Laravel can split later if needed)
+
+### `damage_type_breakdown` on combat damage events (v0.3.0+)
+
+`POST /combat` with `event="damage"` may now carry an optional `damage_type_breakdown` array:
+
+```json
+"damage_type_breakdown": [
+  { "type": "piercing", "amount": 17 },
+  { "type": "psychic",  "amount": 9  }
+]
+```
+
+Populated when the attribution came from a macro `dmSync.attackMessage` call with typed components. Amounts are proportionally scaled to the actual amount applied (handles Apply Half / resistances). Null for native attacks (we don't have per-type info from the chat message) and for un-attributed damage.
+
+### `attack_id` and `attributed_by` on combat damage events (v0.3.0+)
+
+When the GM clicks an Apply button (native tray OR our injected macro button), the `dnd5e.applyDamage` hook fires; the module captures the originating chat message and stamps the resulting `POST /combat` damage event with:
+
+```json
+"attack_id":     "atk_abc123",
+"attributed_by": "click"
+```
+
+If no Apply was clicked (DM edited HP directly on the sheet), the module attempts a heuristic match against recent attacks:
+
+- `attributed_by: "heuristic"` — matched by target_uuid in `target_uuids` of a recent attack (within 120s)
+- `attributed_by: "none"` — no plausible source found; damage event records without attribution (legacy behavior)
+
 ### Full-sync payload (`POST /full-sync`)
 
 Manual macro:
@@ -290,3 +362,4 @@ Conscious omissions, useful when planning the next bundle:
 | 0.1.0 | Initial sync — actors + journals + basic combat start/end. |
 | 0.1.2 | Journal page UUIDs included; promoted journals to first-class entity. |
 | 0.2.0 | Damage / healing / kill detection on HP delta. Narrative-kill ("Mark Defeated") via `updateCombatant`. Combat participants snapshot. **Dice roll logging** via `createChatMessage`. **Monster bestiary fields** (`target_source_uuid`, `target_img`) on damage payloads + participants. |
+| 0.3.0 | **Attack source attribution** (see `combat-tracking.md` in the Laravel repo). New `POST /attack` endpoint with components + total + targets. Auto-synthesizes attacks from native dnd5e damage/healing rolls via `flags.dnd5e.activity`. Adds `dmSync.attackMessage()` and `dmSync.attack()` helpers for player macros (one-line migration). Injects Apply Full/Half/None/Healing buttons onto macro chat cards. Subscribes to `dnd5e.applyDamage` hook to stamp `attack_id` + `attributed_by="click"` on damage events. Heuristic fallback for direct HP edits. Roll events enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`. |
