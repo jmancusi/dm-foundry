@@ -367,23 +367,51 @@ Hooks.on("updateCombatant", (combatant, change) => {
 // ---------------------------------------------------------------------------
 // Dice roll hooks
 // ---------------------------------------------------------------------------
+//
+// dnd5e v5.3.1+ uses ChatMessage5e with `type: "usage"` for activity cards.
+// When a player rolls an attack or damage from a usage card, dnd5e MUTATES
+// the existing message to add rolls (via msg.update) instead of posting a
+// new chat message. So we MUST listen to both createChatMessage AND
+// updateChatMessage to capture every roll.
+//
+// Per-message dedup: postedRollIndexes maps msg.id → Set<roll_index> so we
+// don't re-POST a roll that's already been sent (e.g. when dnd5e mutates the
+// usage card a second time to add damage after attack).
 
-// Classify a chat message's roll. Reads dnd5e flags for type/subtype/item/activity
-// context. Also picks up dm-sync helper flags when present (macro path).
-function classifyRoll(msg) {
+// Per-message ring of roll_indexes we've already POSTed. Bounded by chat
+// message TTL; old entries don't get cleaned but Map size grows slowly.
+const postedRollIndexes = new Map(); // msg.id → Set<roll_index>
+
+function classifyRoll(msg, roll) {
   const dnd5e = msg.flags?.dnd5e ?? {};
   const dmSync = msg.flags?.[MODULE_ID]?.attack ?? null;
 
+  // Prefer dnd5e's explicit roll type tag. Fall back to roll class name —
+  // critical for usage-card messages where flags.dnd5e.roll is absent but
+  // msg.rolls[i] is a typed D20Roll / DamageRoll instance.
+  let type = dnd5e.roll?.type;
+  if (!type && roll) {
+    const cls = roll?.constructor?.name ?? "";
+    if (cls === "D20Roll")        type = "attack";
+    else if (cls === "DamageRoll") type = "damage";
+  }
+  if (!type) type = dmSync ? "damage" : "other";
+
+  // For usage cards with embedded rolls, the message id IS the "originating"
+  // identifier for the activity — no separate originatingMessage flag exists.
+  const originating = dnd5e.originatingMessage ?? msg.id ?? null;
+  const hasActivity = !!dnd5e.activity?.uuid;
+
   return {
-    type:    dnd5e.roll?.type ?? (dmSync ? "damage" : "other"),
+    type,
     subtype: dnd5e.roll?.ability ?? dnd5e.roll?.skillId ?? dnd5e.roll?.tool ?? null,
 
     item_uuid:              dnd5e.item?.uuid ?? null,
-    item_name:              null, // populated from item document lookup if needed
+    item_name:              dnd5e.item?.uuid ? (fromUuidSync?.(dnd5e.item.uuid)?.name ?? null) : null,
     activity_uuid:          dnd5e.activity?.uuid ?? null,
-    originating_message_id: dnd5e.originatingMessage ?? msg.id ?? null,
+    originating_message_id: originating,
     attack_id:              dmSync?.attack_id
-      ?? (dnd5e.originatingMessage ? `native:${dnd5e.originatingMessage}` : null),
+                          ?? (hasActivity ? `native:${originating}` : null),
   };
 }
 
@@ -395,7 +423,6 @@ function extractD20(roll) {
 
   const results = d20Term.results ?? [];
   const active  = results.find(r => r.active) ?? results[0];
-  const all     = results.map(r => r.result);
 
   const mods = d20Term.modifiers ?? [];
   const hasKh = mods.some(m => typeof m === "string" && m.includes("kh"));
@@ -415,24 +442,46 @@ function extractD20(roll) {
   };
 }
 
-Hooks.on("createChatMessage", (msg) => {
+// Walk every individual die in a Roll, capturing face count + result + kept
+// flag. Enables per-die-type averages on the Laravel side ("Bren's avg d6").
+function extractDiceResults(roll) {
+  const out = [];
+  for (const die of (roll?.dice ?? [])) {
+    const faces = die.faces;
+    for (const r of (die.results ?? [])) {
+      out.push({
+        faces,
+        result: r.result,
+        kept:   r.active !== false, // active=true is the default
+      });
+    }
+  }
+  return out;
+}
+
+// Shared processor invoked by both createChatMessage and updateChatMessage.
+// Handles: native-attack synthesis (once per activity), per-roll POSTs with
+// dedup so re-fires for the same message don't double-post.
+function processRollMessage(msg) {
   if (msg.flags?.dm_sync_ignore === true) return;
+  if (!msg.rolls?.length) return;
 
-  const meta = classifyRoll(msg);
-
-  // For native damage/healing messages with an activity, synthesize an attack
-  // event ONCE per originating message so Laravel has the parent record by the
-  // time the apply click sends a damage event.
-  if ((meta.type === "damage" || meta.type === "healing")
-      && meta.activity_uuid
-      && meta.attack_id
-      && !msg.flags?.[MODULE_ID]?.attack
-      && !postedAttacks.has(meta.attack_id)) {
-    postedAttacks.add(meta.attack_id);
-    postNativeAttack(msg, meta);
+  // Synthesize a native attack event when we see damage roll(s) from an
+  // activity. Use the first damage roll's classification (carries activity).
+  const damageRolls = msg.rolls.filter(r => r?.constructor?.name === "DamageRoll");
+  if (damageRolls.length) {
+    const synthMeta = classifyRoll(msg, damageRolls[0]);
+    if (synthMeta.activity_uuid
+        && synthMeta.attack_id
+        && !msg.flags?.[MODULE_ID]?.attack
+        && !postedAttacks.has(synthMeta.attack_id)) {
+      postedAttacks.add(synthMeta.attack_id);
+      postNativeAttack(msg, synthMeta, damageRolls);
+    }
   }
 
-  if (!msg.rolls?.length) return;
+  const seen = postedRollIndexes.get(msg.id) ?? new Set();
+  postedRollIndexes.set(msg.id, seen);
 
   const actor   = ChatMessage.getSpeakerActor?.(msg.speaker) ?? null;
   const combat  = activeCombat();
@@ -443,8 +492,11 @@ Hooks.on("createChatMessage", (msg) => {
     .filter(Boolean);
 
   msg.rolls.forEach((roll, idx) => {
+    if (seen.has(idx)) return;
+    seen.add(idx);
     try {
-      const d20 = extractD20(roll);
+      const d20  = extractD20(roll);
+      const meta = classifyRoll(msg, roll);
       post("roll", {
         uuid:                   msg.uuid ?? msg.id,
         roll_index:             idx,
@@ -459,6 +511,7 @@ Hooks.on("createChatMessage", (msg) => {
         attack_id:              meta.attack_id,
         formula:                roll.formula ?? "",
         total:                  Number(roll.total ?? 0),
+        dice_results:           extractDiceResults(roll),
         d20:                    d20?.d20 ?? null,
         d20_other:              d20?.d20_other ?? null,
         advantage_mode:         d20?.advantage_mode ?? null,
@@ -473,7 +526,10 @@ Hooks.on("createChatMessage", (msg) => {
       warn(`roll extract failed: ${err.message}`);
     }
   });
-});
+}
+
+Hooks.on("createChatMessage", processRollMessage);
+Hooks.on("updateChatMessage", processRollMessage);
 
 // ---------------------------------------------------------------------------
 // Attack tracking: native + helper
@@ -522,43 +578,47 @@ function consumePendingApply(actorUuid) {
   return entry;
 }
 
-// Build and POST an attack event synthesized from a native dnd5e damage roll
-// message. Called once per (originatingMessage, activity.uuid) pair.
-function postNativeAttack(msg, meta) {
+// Build and POST an attack event synthesized from native dnd5e damage rolls
+// in a message. Called once per (msg.id, activity.uuid) pair.
+// damageRolls is the filtered subset of msg.rolls that are DamageRoll instances.
+function postNativeAttack(msg, meta, damageRolls) {
   const actor   = ChatMessage.getSpeakerActor?.(msg.speaker) ?? null;
   const combat  = activeCombat();
   const targets = Array.from(msg.flags?.dnd5e?.targets ?? [])
     .map(t => t?.uuid)
     .filter(Boolean);
 
-  // Aggregate roll totals into a single component (we don't know the per-type
-  // breakdown from a chat message alone — dnd5e bundles types into Roll terms).
-  const total = (msg.rolls ?? []).reduce((sum, r) => sum + Number(r.total ?? 0), 0);
+  // One component per damage roll. Each DamageRoll's options.type carries the
+  // dnd5e damage type (slashing / fire / etc.). Healing rolls show up as
+  // type "healing" via flags.dnd5e.roll.type or — fallback — via the roll
+  // option string. Total is the SUM of the damage rolls only (NOT attack d20s).
+  const components = damageRolls.map((r, i) => ({
+    label:  meta.item_name ?? `Damage ${i + 1}`,
+    type:   r?.options?.type ?? "none",
+    amount: Number(r.total ?? 0),
+  }));
+  const total = components.reduce((s, c) => s + c.amount, 0);
 
-  const itemName = msg.flags?.dnd5e?.item?.uuid
-    ? fromUuidSync?.(msg.flags.dnd5e.item.uuid)?.name ?? null
-    : null;
+  const isHealing = meta.type === "healing"
+    || damageRolls.some(r => r?.options?.type === "healing"
+                          || r?.options?.healing === true);
 
   const payload = {
     attack_id:              meta.attack_id,
     foundry_combat_uuid:    combat?.uuid ?? null,
     actor_uuid:             actor?.uuid ?? null,
     actor_name:             msg.speaker?.alias ?? actor?.name ?? "Unknown",
-    source_label:           itemName ?? "Native attack",
+    source_label:           meta.item_name ?? "Native attack",
     source_kind:            "native",
     item_uuid:              meta.item_uuid,
-    item_name:              itemName,
+    item_name:              meta.item_name,
     activity_uuid:          meta.activity_uuid,
     originating_message_id: meta.originating_message_id,
-    components: [{
-      label: itemName ?? "Damage",
-      type:  inferDamageType(msg) ?? "none",
-      amount: total,
-    }],
+    components,
     total,
-    kind:                   meta.type === "healing" ? "healing" : "damage",
+    kind:                   isHealing ? "healing" : "damage",
     target_uuids:           targets,
-    crit:                   !!msg.flags?.dnd5e?.roll?.critical,
+    crit:                   damageRolls.some(r => r?.options?.critical) || !!msg.flags?.dnd5e?.roll?.critical,
     round:                  combat?.round ?? null,
     turn:                   combat?.turn ?? null,
     occurred_at:            Date.now(),
@@ -566,12 +626,6 @@ function postNativeAttack(msg, meta) {
 
   rememberAttack(payload);
   post("attack", payload);
-}
-
-// Best-effort damage type from the first roll's options.type (dnd5e v5+).
-function inferDamageType(msg) {
-  const first = msg.rolls?.[0];
-  return first?.options?.type ?? null;
 }
 
 // dnd5e.applyDamage fires when actor.applyDamage runs (native tray AND our

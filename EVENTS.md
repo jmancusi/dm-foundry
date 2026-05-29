@@ -2,7 +2,7 @@
 
 What the `dm-sync` FoundryVTT module captures from a live world and how it ships to the Laravel side. This file is the source of truth when planning new features — read it before deciding what extra signals to add.
 
-Last updated for module **v0.3.0**.
+Last updated for module **v0.3.1**.
 
 ## Module settings
 
@@ -58,7 +58,8 @@ In source order (`scripts/main.js`). The `Posts?` column flags which hooks actua
 | `combatStart` | Yes | `POST /combat` with `event=start`, scene name, participants snapshot. |
 | `deleteCombat` | Yes | `POST /combat` with `event=end`. |
 | `updateCombatant` (defeated=true) | Yes | `POST /combat` with `event=damage`, `synthetic=true`, `killed=true`, amount = current HP. Skipped if current HP ≤ 0 (normal HP path already covered it). |
-| `createChatMessage` | Yes | One `POST /roll` per Roll in the chat message (enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`). For native damage/healing rolls with a dnd5e `activity` flag, also auto-synthesizes one `POST /attack` per `(originatingMessage, activity)` pair. Skipped if `msg.flags.dm_sync_ignore === true`. |
+| `createChatMessage` | Yes | One `POST /roll` per Roll in the chat message (enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`, `dice_results`). For messages containing DamageRoll instance(s) on an activity, also auto-synthesizes one `POST /attack` per `(msg.id, activity)` pair. Skipped if `msg.flags.dm_sync_ignore === true`. |
+| `updateChatMessage` | Yes | Same handler as `createChatMessage`. Required because dnd5e v5.3.1+ mutates the activity USAGE card to add attack/damage rolls *after* it's created — those rolls would otherwise be missed. Per-message dedup via an in-memory Set<roll_index> prevents double-POST of rolls we've already sent. |
 | `renderChatMessage` | No | GM-only: injects Apply Full/Half/None (or Apply Healing) buttons onto chat cards stamped with `flags["dm-sync"].attack` (the macro path). Native cards already get dnd5e's built-in `<damage-application>` tray. |
 | `dnd5e.applyDamage` | Yes (indirectly) | Captures `(target_actor_uuid → attack_id)` into a 2s pendingApply map when the GM clicks Apply on a native or macro card. The subsequent `updateActor` event reads this and stamps `attack_id` + `attributed_by="click"` on its `POST /combat` damage event. |
 
@@ -247,7 +248,8 @@ Fires on any `createChatMessage` whose `msg.rolls` array is non-empty. One POST 
 }
 ```
 
-- `type` values from dnd5e: `attack`, `damage`, `save`, `ability`, `skill`, `death`, `initiative`, `tool`. Falls back to `"other"` when the system doesn't tag the roll.
+- `type` values from dnd5e: `attack`, `damage`, `save`, `ability`, `skill`, `death`, `initiative`, `tool`. When `flags.dnd5e.roll.type` is absent (e.g. on usage cards in v5.3.1+ that embed rolls), the module falls back to the Roll instance's class name: `D20Roll` → `"attack"`, `DamageRoll` → `"damage"`, else `"other"`.
+- `dice_results` — array of every individual die rolled, e.g. `[{faces:20,result:14,kept:true}, {faces:6,result:4,kept:true}, {faces:6,result:2,kept:true}]`. Enables per-die-type averages on the Laravel side ("avg d6 for Bren"). Discarded dice (advantage drops, exploding dice cancellations) have `kept:false`.
 - `subtype` — for ability/save rolls, the ability id (`str`/`dex`/…). For skills, the skill id (`athletics`/…). For tools, the tool id. Free-form pass-through from the dnd5e flag.
 - `d20` — the chosen face when the Roll has a d20 term. `null` for pure damage rolls. Detected via `roll.dice.find(d => d.faces === 20)`.
 - `d20_other` — the discarded face under advantage (`kh` modifier) or disadvantage (`kl` modifier). `null` for normal rolls.
@@ -363,3 +365,4 @@ Conscious omissions, useful when planning the next bundle:
 | 0.1.2 | Journal page UUIDs included; promoted journals to first-class entity. |
 | 0.2.0 | Damage / healing / kill detection on HP delta. Narrative-kill ("Mark Defeated") via `updateCombatant`. Combat participants snapshot. **Dice roll logging** via `createChatMessage`. **Monster bestiary fields** (`target_source_uuid`, `target_img`) on damage payloads + participants. |
 | 0.3.0 | **Attack source attribution** (see `combat-tracking.md` in the Laravel repo). New `POST /attack` endpoint with components + total + targets. Auto-synthesizes attacks from native dnd5e damage/healing rolls via `flags.dnd5e.activity`. Adds `dmSync.attackMessage()` and `dmSync.attack()` helpers for player macros (one-line migration). Injects Apply Full/Half/None/Healing buttons onto macro chat cards. Subscribes to `dnd5e.applyDamage` hook to stamp `attack_id` + `attributed_by="click"` on damage events. Heuristic fallback for direct HP edits. Roll events enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`. |
+| 0.3.1 | **Fix: every attack and damage roll is now tracked.** v0.3.0 missed all activity-driven attacks and damage rolls because dnd5e v5.3.1+ MUTATES the existing usage-card message (via `updateChatMessage`) instead of posting a separate roll message — v0.3.0 only listened to `createChatMessage`. Now hooks both, with per-message dedup so re-fires don't double-POST. Roll classification falls back on the Roll class name (`D20Roll` / `DamageRoll`) when `flags.dnd5e.roll.type` is absent. **Per-die capture:** new `dice_results` array on every `/roll` payload — `[{faces, result, kept}, ...]` — captures every individual die face for per-die-type averages (avg d6 / d8 / d20 per player). Native attack synthesis now sums only the DamageRoll instances (was summing attack d20 + damage, double-counting). Damage type now read from each `DamageRoll.options.type` per component. |
