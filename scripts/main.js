@@ -150,6 +150,11 @@ const pendingApply = new Map();
 // when the same usage card is read multiple times.
 const postedAttacks = new Set();
 
+// Per-actor native per-type damage breakdown captured from dnd5e.calculateDamage,
+// consumed by updateActor (2s window) so native damage events carry typed
+// damage even when there's no macro attack flag. Keyed by actor.uuid.
+const pendingBreakdown = new Map();
+
 function activeCombat() {
   return game.combats?.active ?? null;
 }
@@ -175,6 +180,63 @@ function combatParticipantsSnapshot(combat) {
     source_uuid:        actorSourceUuid(c.actor),
     img:                c.actor?.img ?? null,
   })).filter(p => p.foundry_actor_uuid);
+}
+
+// ---------------------------------------------------------------------------
+// v0.4 emission + context helpers (see EVENTS-v0.4.md §Emission model)
+// ---------------------------------------------------------------------------
+
+// Document/structural hooks fire on EVERY connected client. Emit those from a
+// single authoritative client — the active GM — so we don't get N duplicate
+// POSTs. (Workflow hooks like useActivity/restCompleted fire only on the acting
+// client and must NOT be gated this way, or player actions are dropped.)
+function isActiveGM() {
+  return !!game.user?.isGM && game.users?.activeGM?.id === game.user.id;
+}
+
+// The v0.4 context envelope: what was going on at emit time, logged SEPARATELY
+// from the asserted attacker so the Laravel side can reconcile.
+function buildContext(extra = {}) {
+  const combat = activeCombat();
+  const activeActor = combat?.combatant?.actor ?? null;
+  const tokenList = (sel) => sel.map(t => ({ uuid: t?.actor?.uuid ?? null, name: t?.name ?? null }))
+                               .filter(x => x.uuid);
+  return {
+    round:                 combat?.round ?? null,
+    turn:                  combat?.turn ?? null,
+    active_combatant_uuid: activeActor?.uuid ?? null,
+    active_combatant_name: combat?.combatant?.name ?? activeActor?.name ?? null,
+    acting_user_id:        game.user?.id ?? null,
+    targets:               tokenList(Array.from(game.user?.targets ?? [])),
+    selected:              tokenList(canvas?.tokens?.controlled ?? []),
+    ...extra,
+  };
+}
+
+// Ordered snapshot of the combat's turn order at this moment — captures
+// reorders, mid-fight joins, and defeated/skipped combatants as they actually
+// are, so the Laravel side never has to infer a (changing) initiative order.
+function turnOrderSnapshot(combat) {
+  return (combat?.turns ?? []).map(c => ({
+    uuid:       c.actor?.uuid ?? null,
+    name:       c.name,
+    initiative: c.initiative,
+    defeated:   !!c.isDefeated,
+    hidden:     !!c.hidden,
+  }));
+}
+
+function combatantActorUuid(combat, combatantId) {
+  if (!combatantId) return null;
+  return combat?.combatants?.get(combatantId)?.actor?.uuid ?? null;
+}
+
+function consumePendingBreakdown(actorUuid) {
+  const entry = pendingBreakdown.get(actorUuid);
+  if (!entry) return null;
+  pendingBreakdown.delete(actorUuid);
+  if (Date.now() - entry.fired_at > 2000) return null; // stale
+  return entry.breakdown;
 }
 
 // ---------------------------------------------------------------------------
@@ -259,44 +321,60 @@ Hooks.on("updateActor", (a, change) => {
   const combat = activeCombat();
   if (!combat) return;
 
-  // Check for a recent applyDamage hook fire that we should attribute to.
-  const attribution = consumePendingApply(a.uuid);
+  // Resolve attribution. Priority: a clicked Apply (pendingApply) > a heuristic
+  // match against a recent attack > the active combatant as a last resort.
+  const attribution     = consumePendingApply(a.uuid);
+  const nativeBreakdown = consumePendingBreakdown(a.uuid);
   const isDamage = delta > 0;
+  const active   = activeCombatantActor();
+
+  let attackerUuid, attackerName, attackId = null, attributedBy, breakdown;
+
+  if (attribution) {
+    attackerUuid = attribution.actor_uuid ?? active?.uuid ?? null;
+    attackerName = attribution.actor_name ?? active?.name ?? null;
+    attackId     = attribution.attack_id;
+    attributedBy = "click";
+    breakdown    = attribution.damage_type_breakdown ?? nativeBreakdown;
+  } else {
+    const heuristic = heuristicMatch(a.uuid);
+    if (heuristic) {
+      // Credit the MATCHED ATTACK's actor — NOT whoever's turn it is. This is
+      // the fix for the companion-bite cross: the active combatant is the wrong
+      // actor whenever damage is applied off the attacker's turn.
+      attackerUuid = heuristic.actor_uuid ?? active?.uuid ?? null;
+      attackerName = heuristic.actor_name ?? active?.name ?? null;
+      attackId     = heuristic.attack_id;
+      attributedBy = heuristic.loose ? "heuristic_loose" : "heuristic";
+    } else {
+      attackerUuid = active?.uuid ?? null;
+      attackerName = active?.name ?? null;
+      attributedBy = "none";
+    }
+    breakdown = nativeBreakdown;
+  }
 
   const payload = {
     uuid:               combat.uuid,
     event:              isDamage ? "damage" : "healing",
-    attacker_uuid:      attribution?.actor_uuid ?? activeCombatantActor()?.uuid ?? null,
+    attacker_uuid:      attackerUuid,
+    attacker_name:      attackerName,
     target_uuid:        a.uuid,
     target_name:        a.name,
     target_source_uuid: actorSourceUuid(a),
     target_img:         a.img ?? null,
-    attacker_name:      attribution?.actor_name ?? activeCombatantActor()?.name ?? null,
     amount:             Math.abs(delta),
     hp_before:          oldHp,
     hp_after:           newHp,
     killed:             isDamage && oldHp > 0 && newHp <= 0,
+    attributed_by:      attributedBy,
+    context:            buildContext(),
     round:              combat.round,
     turn:               combat.turn,
     occurred_at:        Date.now(),
   };
-
-  if (attribution) {
-    payload.attack_id     = attribution.attack_id;
-    payload.attributed_by = "click";
-    if (attribution.damage_type_breakdown) {
-      payload.damage_type_breakdown = attribution.damage_type_breakdown;
-    }
-  } else {
-    // No applyDamage hook fired — try heuristic match for direct HP edits.
-    const heuristic = heuristicMatch(a.uuid);
-    if (heuristic) {
-      payload.attack_id     = heuristic.attack_id;
-      payload.attributed_by = "heuristic";
-    } else {
-      payload.attributed_by = "none";
-    }
-  }
+  if (attackId)  payload.attack_id = attackId;
+  if (breakdown) payload.damage_type_breakdown = breakdown;
 
   post("combat", payload);
 });
@@ -334,6 +412,7 @@ Hooks.on("deleteCombat", (c) => {
 // Synthesize a damage event for the remaining HP, credit the active combatant.
 Hooks.on("updateCombatant", (combatant, change) => {
   if (change?.defeated !== true) return;
+  if (!isActiveGM()) return; // fires on all clients; emit once
   const combat = combatant.parent;
   if (!combat?.started) return;
 
@@ -362,6 +441,67 @@ Hooks.on("updateCombatant", (combatant, change) => {
     turn:               combat.turn,
     occurred_at:        Date.now(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// v0.4 structural combat stream — turn / round / combatant.
+// These are document-propagation hooks (fire on all clients) → GM-emitter only.
+// ---------------------------------------------------------------------------
+
+// Turn advance: snapshot who's now active + the full current turn order.
+Hooks.on("combatTurnChange", (combat, prior, current) => {
+  if (!isActiveGM()) return;
+  post("combat", {
+    uuid:                  combat.uuid,
+    event:                 "turn",
+    round:                 combat.round,
+    turn:                  combat.turn,
+    active_combatant_uuid: combat.combatant?.actor?.uuid ?? null,
+    active_combatant_name: combat.combatant?.name ?? null,
+    prior_combatant_uuid:  combatantActorUuid(combat, prior?.combatantId),
+    turn_order:            turnOrderSnapshot(combat),
+    occurred_at:           Date.now(),
+  });
+});
+
+// Round advance/rewind.
+Hooks.on("combatRound", (combat, updateData, updateOptions) => {
+  if (!isActiveGM()) return;
+  post("combat", {
+    uuid:        combat.uuid,
+    event:       "round",
+    round:       updateData?.round ?? combat.round,
+    direction:   updateOptions?.direction ?? 1,
+    occurred_at: Date.now(),
+  });
+});
+
+// Combatant lifecycle: mid-fight joins, removals, initiative/defeated changes.
+function postCombatantEvent(combatant, action) {
+  if (!isActiveGM()) return;
+  const combat = combatant.parent ?? combatant.combat;
+  if (!combat) return;
+  post("combat", {
+    uuid:         combat.uuid,
+    event:        "combatant",
+    action,
+    actor_uuid:   combatant.actor?.uuid ?? null,
+    display_name: combatant.name,
+    initiative:   combatant.initiative ?? null,
+    defeated:     !!combatant.isDefeated,
+    round:        combat.round,
+    turn:         combat.turn,
+    occurred_at:  Date.now(),
+  });
+}
+Hooks.on("createCombatant", (c) => postCombatantEvent(c, "added"));
+Hooks.on("deleteCombatant", (c) => postCombatantEvent(c, "removed"));
+Hooks.on("updateCombatant", (c, change) => {
+  // Separate from the synthetic-kill handler above: log initiative / defeated
+  // changes to the combatant stream. (defeated=true still also drives the kill.)
+  if (change?.initiative !== undefined || change?.defeated !== undefined) {
+    postCombatantEvent(c, "updated");
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -497,7 +637,7 @@ function processRollMessage(msg) {
     try {
       const d20  = extractD20(roll);
       const meta = classifyRoll(msg, roll);
-      post("roll", {
+      const rollPayload = {
         uuid:                   msg.uuid ?? msg.id,
         roll_index:             idx,
         actor_uuid:             actor?.uuid ?? null,
@@ -521,7 +661,21 @@ function processRollMessage(msg) {
         round,
         turn,
         occurred_at:            Date.now(),
-      });
+      };
+
+      // Death-save enrichment: outcome of this save + the running 0–3 counts
+      // from the actor's death-save tracker (read after the roll resolved).
+      if (meta.type === "death") {
+        const death = actor?.system?.attributes?.death ?? {};
+        const total = Number(roll.total ?? 0);
+        rollPayload.death_save_outcome = d20?.d20 === 20 ? "critical"
+          : d20?.d20 === 1 ? "fumble"
+          : (total >= 10 ? "success" : "failure");
+        rollPayload.death_save_successes = death.success ?? null;
+        rollPayload.death_save_failures  = death.failure ?? null;
+      }
+
+      post("roll", rollPayload);
     } catch (err) {
       warn(`roll extract failed: ${err.message}`);
     }
@@ -547,6 +701,7 @@ function rememberAttack(attack) {
     target_uuids:  attack.target_uuids ?? [],
     posted_at:     Date.now(),
     actor_uuid:    attack.actor_uuid,
+    actor_name:    attack.actor_name ?? null,
   });
   // Trim oldest entries
   const cutoff = Date.now() - HEURISTIC_WINDOW_MS;
@@ -555,18 +710,21 @@ function rememberAttack(attack) {
   }
 }
 
+// Returns the matched attack entry annotated with `loose`: false when the match
+// was by target (high confidence), true for the any-recent-attack fallback
+// (low confidence → the Laravel side records it as attributed_by:heuristic_loose).
 function heuristicMatch(targetActorUuid) {
   const cutoff = Date.now() - HEURISTIC_WINDOW_MS;
   // Most recent attack whose targets include this actor.
   for (let i = recentAttacks.length - 1; i >= 0; i--) {
     const a = recentAttacks[i];
     if (a.posted_at < cutoff) continue;
-    if (a.target_uuids.includes(targetActorUuid)) return a;
+    if (a.target_uuids.includes(targetActorUuid)) return { ...a, loose: false };
   }
   // Loose fallback: any recent attack regardless of target (DM might've
   // targeted a different token than the player marked).
   const recent = recentAttacks[recentAttacks.length - 1];
-  return (recent && recent.posted_at >= cutoff) ? recent : null;
+  return (recent && recent.posted_at >= cutoff) ? { ...recent, loose: true } : null;
 }
 
 function consumePendingApply(actorUuid) {
@@ -619,6 +777,7 @@ function postNativeAttack(msg, meta, damageRolls) {
     kind:                   isHealing ? "healing" : "damage",
     target_uuids:           targets,
     crit:                   damageRolls.some(r => r?.options?.critical) || !!msg.flags?.dnd5e?.roll?.critical,
+    context:                buildContext(),
     round:                  combat?.round ?? null,
     turn:                   combat?.turn ?? null,
     occurred_at:            Date.now(),
@@ -653,6 +812,25 @@ Hooks.on("dnd5e.applyDamage", (actor, amount, options) => {
   });
 });
 
+// dnd5e.calculateDamage fires during damage application with the post-resistance
+// per-type `damages` array — even for native cards that carry no dm-sync flag.
+// Stash it so updateActor attaches a native damage_type_breakdown. Fires on the
+// applying client, the same one that posts the damage event.
+Hooks.on("dnd5e.calculateDamage", (actor, damages, options) => {
+  if (!actor?.uuid || !Array.isArray(damages)) return;
+  const byType = {};
+  for (const d of damages) {
+    const type = d?.type ?? "none";
+    byType[type] = (byType[type] || 0) + Math.abs(Number(d?.value ?? 0));
+  }
+  const breakdown = Object.entries(byType)
+    .filter(([, amount]) => amount > 0)
+    .map(([type, amount]) => ({ type, amount: Math.round(amount) }));
+  if (breakdown.length) {
+    pendingBreakdown.set(actor.uuid, { breakdown, fired_at: Date.now() });
+  }
+});
+
 function deriveBreakdown(dmSyncAttack, amount) {
   if (!dmSyncAttack?.components) return null;
   // Sum components per damage type, then proportionally scale to the actual
@@ -669,6 +847,94 @@ function deriveBreakdown(dmSyncAttack, amount) {
     amount: Math.round(amt * scale),
   }));
 }
+
+// ---------------------------------------------------------------------------
+// v0.4 activity / effect / rest streams
+// ---------------------------------------------------------------------------
+
+// Action economy: every activity used (attack, spell, feature, even non-damage).
+// Workflow hook — fires only on the acting user's client, so NOT GM-gated.
+Hooks.on("dnd5e.postUseActivity", (activity, usageConfig /*, results */) => {
+  try {
+    const actor = activity?.actor ?? null;
+    const item  = activity?.item ?? null;
+    const consume = usageConfig?.consume ?? {};
+    post("activity", {
+      activity_uuid: activity?.uuid ?? null,
+      activity_type: activity?.type ?? null,
+      activity_name: activity?.name ?? item?.name ?? null,
+      actor_uuid:    actor?.uuid ?? null,
+      actor_name:    actor?.name ?? null,
+      item_uuid:     item?.uuid ?? null,
+      item_name:     item?.name ?? null,
+      consumed: {
+        uses:       consume?.consumeUsage ?? null,
+        spell_slot: consume?.consumeSpellSlot ?? null,
+        resource:   consume?.consumeResource ?? null,
+      },
+      context:       buildContext(),
+      occurred_at:   Date.now(),
+    });
+  } catch (err) {
+    warn(`activity post failed: ${err.message}`);
+  }
+});
+
+// Active effects + conditions + concentration. Concentration is itself an
+// active effect (tagged kind="concentration"). Document hook → GM-emitter.
+function postEffect(effect, action) {
+  if (!isActiveGM()) return;
+  // Unlinked-token quirk (Foundry #5021): these hooks can pass the synthetic
+  // Actor as arg 0 rather than the ActiveEffect. Guard to real effects; effects
+  // on unlinked tokens (most monsters) are a known follow-up gap.
+  if (effect?.documentName !== "ActiveEffect") return;
+
+  const actor    = effect.parent ?? null;
+  const statuses = Array.from(effect.statuses ?? []);
+  const isConc   = !!effect.getFlag?.("dnd5e", "concentration")
+                 || statuses.includes("concentrating")
+                 || /concentrat/i.test(effect.name ?? "");
+
+  try {
+    post("effect", {
+      action,
+      kind:        isConc ? "concentration" : (statuses.length ? "condition" : "effect"),
+      actor_uuid:  actor?.uuid ?? null,
+      actor_name:  actor?.name ?? null,
+      effect_name: effect.name ?? null,
+      statuses,
+      origin:      effect.origin ?? null,
+      duration:    effect.duration
+        ? { rounds: effect.duration.rounds ?? null, seconds: effect.duration.seconds ?? null }
+        : null,
+      context:     buildContext(),
+      occurred_at: Date.now(),
+    });
+  } catch (err) {
+    warn(`effect post failed: ${err.message}`);
+  }
+}
+Hooks.on("createActiveEffect", (e) => postEffect(e, "applied"));
+Hooks.on("updateActiveEffect", (e) => postEffect(e, "changed"));
+Hooks.on("deleteActiveEffect", (e) => postEffect(e, "removed"));
+
+// Short/long rest recovery. Workflow hook → fires on the resting actor's
+// client, NOT GM-gated.
+Hooks.on("dnd5e.restCompleted", (actor, result /*, config */) => {
+  try {
+    post("rest", {
+      actor_uuid:            actor?.uuid ?? null,
+      actor_name:            actor?.name ?? null,
+      type:                  result?.longRest ? "long" : "short",
+      hp_recovered:          result?.dhp ?? null,
+      hit_dice_recovered:    result?.dhd ?? null,
+      spell_slots_recovered: !!result?.longRest,
+      occurred_at:           Date.now(),
+    });
+  } catch (err) {
+    warn(`rest post failed: ${err.message}`);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Render hook: inject Apply buttons on macro chat cards
@@ -839,6 +1105,7 @@ function postHelperAttack(flagPayload, createdMessageId) {
     kind:                   flagPayload.kind,
     target_uuids:           flagPayload.target_uuids,
     crit:                   flagPayload.crit,
+    context:                buildContext(),
     round:                  combat?.round ?? null,
     turn:                   combat?.turn ?? null,
     occurred_at:            Date.now(),
