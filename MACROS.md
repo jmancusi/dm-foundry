@@ -8,21 +8,21 @@ Read alongside [`EVENTS.md`](EVENTS.md) (the payload contract) and the `dmSync` 
 
 ## The one rule: native first, macro as fallback
 
-A macro is a **workaround for things native dnd5e can't bundle into a single roll** — e.g. a weapon hit + a conditional rider (Hunter's Mark) + a feature die (Dread Ambusher) all at once. That's the only reason to reach for one.
+A macro is a **workaround for damage that core dnd5e won't bundle or fire conditionally**. Be realistic about what "native" actually does **out of the box** (no automation modules):
 
-Before writing a macro, ask whether native dnd5e can model it now (dnd5e v5 is far more capable than it used to be):
-
-| Need | Native option | Macro needed? |
+| Need | Core dnd5e (no modules)? | Macro needed? |
 |---|---|---|
-| Extra damage die on a weapon | Item → Activity → extra **damage part** | No |
-| Conditional rider (Hunter's Mark) | Hunter's Mark spell + concentration automation adds to weapon damage | Usually no |
-| First-round bonus (Dread Ambusher) | **Active Effect** adding a damage part, gated on round | Often no |
-| Reroll-and-keep-higher (Savage Attacker) | dnd5e reroll modifier on the damage part | Sometimes |
-| Truly bespoke multi-source bundle | — | **Yes** |
+| A weapon's own damage, doubled on crit | ✅ native, automatic | No |
+| A **static** always-on extra damage part on a weapon | ✅ native (add a damage part to the activity); doubles on crit | No |
+| **Conditional rider** — Hunter's Mark only on a marked target | ❌ **not native.** Picking "Longbow attack" rolls the longbow only; nothing extra fires. Needs an automation stack (Midi-QOL / DAE / *Automated Conditions 5e* / *Better Curses*). | **Yes** |
+| **Situational feature die** — Dread Ambusher (round 1 only), Sneak Attack, etc. | ❌ not native conditionally | **Yes** |
+| Reroll-and-keep-higher (Savage Attacker) across a bundle | ❌ not native across mixed sources | **Yes** |
 
-**The goal is to use macros less over time.** Every attack we model natively is one fewer macro to maintain — and native cards get dnd5e's real damage-application rules (per-type resistance, immunity, vulnerability) for free, which a macro's injected buttons only approximate (see [Known limitation](#known-limitation-multi-type-apply)).
+> **Reality check (learned the hard way):** earlier drafts of this doc claimed Hunter's Mark / Dread Ambusher could "usually" be native. They can't, in *core* dnd5e — targeting happens outside the action and the system does not add marked-target or first-round dice to a plain weapon attack. Making that automatic means adopting and babysitting a heavy automation module stack, which isn't worth it for a working table. **Conditional bundling is exactly what these macros are for — they're the correct tool, not a smell.**
 
-When a macro IS the right call, the rest of this doc is the recipe.
+What you *don't* need a separate macro for is **crit**: don't keep a doubled-dice "crit" copy of an attack as its own concept in the data — see [Crit variants](#crit-variants).
+
+**The goal isn't "zero macros"** — it's that every macro flows through `dmSync.attackMessage` so its damage is tracked and attributable. The rest of this doc is the recipe.
 
 ---
 
@@ -61,6 +61,19 @@ await dmSync.attackMessage({
 - **`total` must equal the sum of component amounts** and match what the card shows. The tool reconciles them.
 - **`kind: "healing"`** for healing macros — amounts stay positive; the module flips the sign on apply.
 - **Targets:** target the token(s) before running the macro (normal targeting, the crosshair). The attack snapshots `game.user.targets`. If you forget, the Apply buttons fall back to whatever you have targeted at click time.
+
+### Crit variants
+
+A crit isn't a different attack — it's the same attack with the dice doubled. When you keep a separate "crit" copy of a macro (the doubled-dice version), give it the **same `source` as its normal version** and just set **`crit: true`**:
+
+```js
+// normal:  source: "Longbow + Hunter's Mark",  crit: false
+// crit:    source: "Longbow + Hunter's Mark",  crit: true
+```
+
+Keeping `source` identical means the by-action breakdown aggregates crit and non-crit hits under one label (e.g. all "Longbow + Hunter's Mark" damage together) instead of splitting "Longbow (Crit)" into its own wedge — while `crit` stays queryable on the attack record. The doubled dice are already in `total`/`components`, so nothing else changes.
+
+> If you're maintaining a 2×2 of macros (mode × crit), that's fine — it's a content choice, not a tracking concern. They all carry the same two `source` labels; only `crit` differs.
 
 ---
 
@@ -180,11 +193,23 @@ Example request → build:
 
 ---
 
+## Reference: the Daeris longbow family (fully migrated)
+
+The four macros in `dm/macros/daeris/` are the worked reference for the **single-target bundled weapon attack**, all migrated to `dmSync.attackMessage`:
+
+| File | source | crit | components |
+|---|---|---|---|
+| `hunters-mark+bow+no-crit` | Longbow + Hunter's Mark | `false` | Longbow (piercing), Hunter's Mark (piercing) |
+| `hunters-mark+bow-crit` | Longbow + Hunter's Mark | `true` | same (dice doubled) |
+| `oepning-round-no-crit` | Longbow + Hunter's Mark + Dreadful Strike | `false` | + Dreadful Strike (psychic) |
+| `opening-round-crit` | Longbow + Hunter's Mark + Dreadful Strike | `true` | + Dreadful Strike (psychic) |
+
+Sustained vs. opening-round = which riders are in the bundle; crit vs. non-crit = the `crit` flag (same `source`). Dex is folded into the Longbow component.
+
 ## Variants still to document
 
-This guide is built from the opening-round bundle + the quick-apply macro. To make it complete, the following patterns should be folded in once we examine the remaining macros:
+Folded in so far: the bundled single-target attack + crit variants (above) and the quick-apply fallback. Still to capture from the remaining macros:
 
 - **Healing macros** (`kind: "healing"`, Apply Healing button).
-- **Savage Attacker / reroll-and-keep-higher** — how to evaluate two rolls and report the kept one (Shargalar).
+- **Savage Attacker / reroll-and-keep-higher** — how to evaluate two rolls and report the kept one (Shargalar — next).
 - **Save-for-half / AOE multi-target** — targeting and per-target application.
-- **Sustained vs. opening-round** variants (which riders drop after round 1).
