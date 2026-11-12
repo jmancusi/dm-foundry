@@ -40,6 +40,11 @@ Idempotency keys are documented per event below; resending the same payload is a
 | `POST /roll` | any chat message containing rolls | `(campaign_id, uuid, roll_index)` |
 | `POST /attack` | helper call (`dmSync.attackMessage()` / `dmSync.attack()`) OR auto-synthesized once per native dnd5e damage/healing roll with `flags.dnd5e.activity` | `(campaign_id, attack_id)` — upsert |
 | `POST /full-sync` | manual macro (`dmSync.fullSync()`) | upserts all actors + journals |
+| `POST /level-ups` | GM macro `dmSync.pullLevels()` (v0.5.0+) — **answers with data** | read-only: what each character's missing builder levels add |
+| `POST /level-ups/backup` | `pullLevels()`, before it changes an actor | one row per pull; the newest five snapshots per actor are kept |
+| `POST /level-ups/applied` | `pullLevels()`, after it changes an actor | `push_id` — marks that pull applied / failed |
+| `POST /level-ups/backups` | GM macro `dmSync.restoreLevelBackup()` | read-only: an actor's kept backups |
+| `POST /level-ups/backup-data` | `restoreLevelBackup()` | read-only: one backup's `toObject()` |
 
 ## Hooks listened to
 
@@ -48,7 +53,7 @@ In source order (`scripts/main.js`). The `Posts?` column flags which hooks actua
 | Hook | Posts? | What we send |
 |---|---|---|
 | `init` | No | Registers settings. |
-| `ready` | No | Logs version, exposes `globalThis.dmSync.fullSync()`. |
+| `ready` | No | Logs version, exposes `globalThis.dmSync` (`fullSync`, `attackMessage`, `attack`, `pullLevels`, `restoreLevelBackup`). |
 | `preUpdateActor` | No | Stashes old HP into a module-local `Map` so `updateActor` can compute a delta. |
 | `createActor` | Yes | `POST /actor` with full actor payload (subject to filter). |
 | `updateActor` | Yes | `POST /actor` with full actor payload (subject to filter). On HP delta during active combat, also `POST /combat` with `event=damage` or `event=healing`. |
@@ -107,6 +112,9 @@ Built by `actorPayload()`. Sent on create/update.
   ]
 }
 ```
+
+v0.5.0+ also sends `"flags": {"dm-sync": {"build_id": 12}}` — set on actors imported from the character builder, `null` otherwise.
+
 
 The `system.*` keys passed through are the full dnd5e schema unchanged — useful for any future feature that wants more detail without a module bump.
 
@@ -344,6 +352,38 @@ globalThis.dmSync.fullSync()  // shows a confirm dialog
 
 Only sends actors that pass `shouldSyncActor()` (PCs always, NPCs gated by setting). Does **not** include combat events or rolls — those are append-only and can't be reconciled retroactively from world state.
 
+### Level pull (`POST /level-ups…`, v0.5.0+)
+
+Two GM macros, never hooks. They use `signedRequest()`, which is signed like `post()` but
+waits for Laravel's JSON answer — so it's only ever called from a macro (CLAUDE.md §0).
+
+```js
+dmSync.pullLevels()          // preview → back up → apply builder levels to Foundry actors
+dmSync.restoreLevelBackup()  // put an actor back as it was before a pull
+```
+
+`POST /level-ups` request — every character actor in the world:
+```json
+{
+  "system_version": "5.3.3",
+  "actors": [{
+    "uuid": "Actor.abc123", "name": "Pip",
+    "classes": [{ "identifier": "fighter", "levels": 4 }],
+    "items":   [{ "_id": "x1…", "type": "class", "name": "Fighter", "source": "Compendium.dnd-players-handbook.classes.Item.phbftrFighter000" }]
+  }]
+}
+```
+Answer: `characters` the builder is ahead of, each with `from`, `to`, `summary` (preview lines), `create`
+(full item documents to create with `keepId`), `update` (`{_id, changes}` dotted update paths on the actor's
+own items — class levels and the new levels' advancement values) and `actor` (amounts and additions:
+ability deltas, new save/skill/tool proficiencies, trait keys to add, `hp` gained). `blocked` lists characters
+that can't be pulled, with the reason (Foundry ahead of the builder, classes that don't match, an unfinished
+level, a different dnd5e major). Actors that aren't builder characters are left out.
+
+`/level-ups/backup` `{uuid, from, to, actor: actor.toObject()}` → `{push_id}`; `/level-ups/applied`
+`{push_id, ok, error?}`; `/level-ups/backups` `{uuid}` → `{backups: [{id, from, to, status, at}]}`;
+`/level-ups/backup-data` `{push_id}` → `{actor}`. Errors answer 422 `{error}`.
+
 ## What's NOT captured
 
 Conscious omissions, useful when planning the next bundle:
@@ -366,4 +406,5 @@ Conscious omissions, useful when planning the next bundle:
 | 0.2.0 | Damage / healing / kill detection on HP delta. Narrative-kill ("Mark Defeated") via `updateCombatant`. Combat participants snapshot. **Dice roll logging** via `createChatMessage`. **Monster bestiary fields** (`target_source_uuid`, `target_img`) on damage payloads + participants. |
 | 0.3.0 | **Attack source attribution** (see `combat-tracking.md` in the Laravel repo). New `POST /attack` endpoint with components + total + targets. Auto-synthesizes attacks from native dnd5e damage/healing rolls via `flags.dnd5e.activity`. Adds `dmSync.attackMessage()` and `dmSync.attack()` helpers for player macros (one-line migration). Injects Apply Full/Half/None/Healing buttons onto macro chat cards. Subscribes to `dnd5e.applyDamage` hook to stamp `attack_id` + `attributed_by="click"` on damage events. Heuristic fallback for direct HP edits. Roll events enriched with `item_uuid`, `activity_uuid`, `originating_message_id`, `attack_id`. |
 | 0.4.0 | **Telemetry expansion** (see `EVENTS-v0.4.md` for full payloads — fold into this doc on release). New `context` envelope (active combatant / acting user / targets / selected) on damage + attack events, logged separately from the attacker. New `/combat` events `turn` / `round` / `combatant` (structural stream, active-GM-emitter). New endpoints `/activity`, `/effect`, `/rest`. Native per-type `damage_type_breakdown` via `dnd5e.calculateDamage`. **Attribution fix:** heuristic now credits the matched attack's actor (not the active combatant), with a low-confidence `heuristic_loose` for the any-recent-attack fallback. Death-save rolls enriched with outcome + running 0–3 count. |
+| 0.5.0 | **Level pull.** GM macros `dmSync.pullLevels()` and `dmSync.restoreLevelBackup()` add levels finished in the DM tool's character builder to Foundry actors — only what the new levels add, after backing the actor up — and can undo a pull. New `signedRequest()` helper (awaits the answer; macros only). The actor payload now carries `flags["dm-sync"]`, so a builder character links by its `build_id`. |
 | 0.3.1 | **Fix: every attack and damage roll is now tracked.** v0.3.0 missed all activity-driven attacks and damage rolls because dnd5e v5.3.1+ MUTATES the existing usage-card message (via `updateChatMessage`) instead of posting a separate roll message — v0.3.0 only listened to `createChatMessage`. Now hooks both, with per-message dedup so re-fires don't double-POST. Roll classification falls back on the Roll class name (`D20Roll` / `DamageRoll`) when `flags.dnd5e.roll.type` is absent. **Per-die capture:** new `dice_results` array on every `/roll` payload — `[{faces, result, kept}, ...]` — captures every individual die face for per-die-type averages (avg d6 / d8 / d20 per player). Native attack synthesis now sums only the DamageRoll instances (was summing attack d20 + damage, double-counting). Damage type now read from each `DamageRoll.options.type` per component. |

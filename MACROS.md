@@ -213,3 +213,29 @@ Folded in so far: the bundled single-target attack + crit variants (above) and t
 - **Healing macros** (`kind: "healing"`, Apply Healing button).
 - **Savage Attacker / reroll-and-keep-higher** — how to evaluate two rolls and report the kept one (Shargalar — next).
 - **Save-for-half / AOE multi-target** — targeting and per-target application.
+
+---
+
+## Level pull macros (v0.5.0+)
+
+Two one-line GM macros for characters made in the DM tool's character builder. Make each a Script macro on the
+GM's hotbar:
+
+```js
+dmSync.pullLevels()
+```
+
+After players finish the levels you allowed in the builder: lists every character the builder is ahead of, with
+what each new level adds ("Fighter 5 → 6, adds Indomitable, Strength 18 → 20, Hit points +9"). Untick anyone to
+skip. On Apply it backs each actor up to the DM tool, then adds the new features and spells, raises the class
+level, records the level's choices on the class, and adds the hit points gained to current HP — damage taken and
+items picked up in play stay as they are. dnd5e's own level-up prompts don't appear. Characters it can't pull are
+listed with the reason. Running it again does nothing.
+
+```js
+dmSync.restoreLevelBackup()
+```
+
+Puts a character back exactly as it was before one of its last five pulls (select its token first to preselect
+it). Everything since that pull, play included, is replaced, so it asks first.
+

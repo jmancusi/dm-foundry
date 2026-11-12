@@ -1,8 +1,8 @@
 {
   "id": "dm-sync",
   "title": "DM Campaign Prep Sync",
-  "description": "One-way sync of actors, journals, and combat events from FoundryVTT into the DM campaign-prep tool.",
-  "version": "0.4.0",
+  "description": "Syncs actors, journals, and combat events from FoundryVTT into the DM campaign-prep tool, and pulls character-builder level-ups back in.",
+  "version": "0.5.0",
   "compatibility": {
     "minimum": "13",
     "verified": "14"

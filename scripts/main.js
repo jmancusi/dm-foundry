@@ -77,6 +77,34 @@ async function post(event, body) {
   }
 }
 
+// Signed call that waits for and returns Laravel's JSON answer. MACROS ONLY: a hook must
+// never await the network (CLAUDE.md §0) — hooks use the fire-and-forget post() above.
+async function signedRequest(event, body) {
+  const endpoint   = (setting(S.endpoint) || "").trim().replace(/\/+$/, "");
+  const campaignId = setting(S.campaignId);
+  const secret     = (setting(S.secret) || "").trim();
+  if (!endpoint || !campaignId || !secret) {
+    throw new Error(game.i18n.localize("DM_SYNC.Errors.NotConfigured"));
+  }
+
+  const ts   = Math.floor(Date.now() / 1000);
+  const json = JSON.stringify(body);
+  const hmac = await hmacSha256Hex(secret, `${ts}.${json}`);
+  const res  = await fetch(`${endpoint}/${event}`, {
+    method: "POST",
+    headers: {
+      "Content-Type":   "application/json",
+      "Accept":         "application/json",
+      "X-DM-Signature": `t=${ts},v1=${hmac}`,
+      "X-DM-Campaign":  String(campaignId),
+    },
+    body: json,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? data.message ?? `HTTP ${res.status}`);
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Payload builders
 // ---------------------------------------------------------------------------
@@ -103,6 +131,8 @@ function actorPayload(a) {
       img:    i.img,
       system: i.system,
     })),
+    // A character imported from the DM tool's builder carries its build id here.
+    flags: { "dm-sync": a.flags?.[MODULE_ID] ?? null },
   };
 }
 
@@ -1139,11 +1169,199 @@ async function fullSync() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Pull levels / Restore level backup (GM macros; character-builder.md Phase 7B)
+//
+// Levels players finish in the DM tool's character builder are added to their Foundry
+// actors here. Laravel works out exactly what each missing level adds; this only shows
+// it, backs the actor up and applies the patches. Run from a macro — never a hook.
+// ---------------------------------------------------------------------------
+
+function escapeHtml(text) {
+  return String(text ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+/** A dialog with one OK button; resolves to the dialog's form element, or null if closed. */
+async function formDialog(title, content, okLabel) {
+  const DialogV2 = foundry.applications?.api?.DialogV2;
+  if (DialogV2) {
+    try {
+      return await DialogV2.prompt({
+        window:  { title },
+        content: `<form>${content}</form>`,
+        ok:      { label: okLabel, callback: (event, button) => button.form },
+        rejectClose: false,
+        position: { width: 520 },
+      });
+    } catch {
+      return null;
+    }
+  }
+  return new Promise(resolve => new Dialog({
+    title,
+    content: `<form>${content}</form>`,
+    buttons: { ok: { label: okLabel, callback: html => resolve(html[0].querySelector("form") ?? html.find("form")[0]) } },
+    close: () => resolve(null),
+  }).render(true));
+}
+
+function itemSource(i) {
+  return i._stats?.compendiumSource ?? i.flags?.dnd5e?.sourceId ?? i.flags?.core?.sourceId ?? null;
+}
+
+async function pullLevels() {
+  if (!game.user.isGM) return ui.notifications.warn("Only the GM can pull levels.");
+
+  const actors = game.actors.contents.filter(a => a.type === "character").map(a => ({
+    uuid:    a.uuid,
+    name:    a.name,
+    classes: a.items.filter(i => i.type === "class").map(c => ({ identifier: c.system.identifier, levels: c.system.levels })),
+    items:   a.items.map(i => ({ _id: i.id, type: i.type, name: i.name, source: itemSource(i) })),
+  }));
+
+  let plan;
+  try {
+    plan = await signedRequest("level-ups", { actors, system_version: game.system.version });
+  } catch (err) {
+    return ui.notifications.error(`Pull levels: ${err.message}`);
+  }
+  const characters = plan.characters ?? [];
+  const blocked    = plan.blocked ?? [];
+  if (!characters.length && !blocked.length) {
+    return ui.notifications.info("Pull levels: every character is up to date with the builder.");
+  }
+
+  const rows = characters.map((c, i) => `
+    <div style="margin: .5em 0">
+      <label><input type="checkbox" name="pick${i}" checked> <strong>${escapeHtml(c.name)}</strong> — level ${c.from} → ${c.to}</label>
+      <ul style="margin: .25em 0 0 1.5em">${c.summary.map(l => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
+    </div>`).join("");
+  const held = blocked.length
+    ? `<p style="margin-top:1em"><strong>Not pulled</strong></p><ul>${blocked.map(b => `<li>${escapeHtml(b.name)}: ${escapeHtml(b.reason)}</li>`).join("")}</ul>`
+    : "";
+  const header = `<p>World <strong>${escapeHtml(game.world.title)}</strong> · Foundry ${escapeHtml(game.version)} · dnd5e ${escapeHtml(game.system.version)}</p>
+    <p>Each character is backed up to the DM tool first. Undo with <code>dmSync.restoreLevelBackup()</code>.</p>`;
+
+  const form = await formDialog("Pull levels from the builder", header + (rows || "<p>Nothing can be pulled yet.</p>") + held, characters.length ? "Apply" : "Close");
+  if (!form || !characters.length) return;
+
+  const picked = characters.filter((c, i) => form.elements[`pick${i}`]?.checked);
+  let done = 0;
+  for (const change of picked) {
+    if (await applyLevelChange(change)) done++;
+  }
+  ui.notifications.info(`Pull levels: ${done} of ${picked.length} character${picked.length === 1 ? "" : "s"} levelled.`);
+}
+
+async function applyLevelChange(change) {
+  const actor = await fromUuid(change.uuid);
+  if (!actor) {
+    warn(`${change.name}: actor not found`);
+    return false;
+  }
+
+  let pushId;
+  try {
+    pushId = (await signedRequest("level-ups/backup", { uuid: change.uuid, from: change.from, to: change.to, actor: actor.toObject() })).push_id;
+  } catch (err) {
+    warn(`${change.name}: backup failed (${err.message}), so nothing was changed`);
+    return false;
+  }
+
+  try {
+    if (change.create.length) {
+      await actor.createEmbeddedDocuments("Item", change.create, { keepId: true });
+    }
+    const updates = change.update.map(u => ({ _id: u._id, ...u.changes }));
+    if (updates.length) {
+      await actor.updateEmbeddedDocuments("Item", updates);
+    }
+    const patch = actorLevelPatch(actor, change.actor);
+    if (Object.keys(patch).length) {
+      await actor.update(patch);
+    }
+    await signedRequest("level-ups/applied", { push_id: pushId, ok: true });
+    log(`levelled ${change.name} ${change.from} → ${change.to}`);
+    return true;
+  } catch (err) {
+    console.error(`[${MODULE_ID}]`, err);
+    await signedRequest("level-ups/applied", { push_id: pushId, ok: false, error: String(err.message ?? err) }).catch(() => {});
+    ui.notifications.error(`${change.name}: the pull stopped part-way (${err.message}). Put it back with dmSync.restoreLevelBackup().`);
+    return false;
+  }
+}
+
+/** Amounts and additions on top of what the actor has now, so play since the import is kept. */
+function actorLevelPatch(actor, ch = {}) {
+  const sys = actor.system;
+  const u = {};
+  for (const [a, delta] of Object.entries(ch.abilities ?? {})) {
+    u[`system.abilities.${a}.value`] = (sys.abilities?.[a]?.value ?? 10) + delta;
+  }
+  for (const a of ch.saves ?? []) u[`system.abilities.${a}.proficient`] = 1;
+  for (const [k, v] of Object.entries(ch.skills ?? {})) {
+    u[`system.skills.${k}.value`] = Math.max(sys.skills?.[k]?.value ?? 0, v);
+  }
+  for (const [k, v] of Object.entries(ch.tools ?? {})) {
+    u[`system.tools.${k}.value`] = Math.max(sys.tools?.[k]?.value ?? 0, v.value);
+    if (v.ability && !sys.tools?.[k]) u[`system.tools.${k}.ability`] = v.ability;
+  }
+  for (const [k, values] of Object.entries(ch.traits ?? {})) {
+    const path = k === "mastery" ? "weaponProf.mastery" : k;
+    const current = foundry.utils.getProperty(sys.traits ?? {}, `${path}.value`) ?? [];
+    u[`system.traits.${path}.value`] = [...new Set([...current, ...values])];
+  }
+  if (ch.hp) u["system.attributes.hp.value"] = (sys.attributes?.hp?.value ?? 0) + ch.hp;
+  return u;
+}
+
+async function restoreLevelBackup() {
+  if (!game.user.isGM) return ui.notifications.warn("Only the GM can restore a backup.");
+
+  const characters = game.actors.contents.filter(a => a.type === "character").sort((a, b) => a.name.localeCompare(b.name));
+  const preselect  = canvas?.tokens?.controlled?.[0]?.actor?.uuid;
+  const pickActor  = await formDialog("Restore level backup",
+    `<p>Whose backup?</p><select name="actor" style="width:100%">${characters.map(a => `<option value="${a.uuid}" ${a.uuid === preselect ? "selected" : ""}>${escapeHtml(a.name)}</option>`).join("")}</select>`,
+    "Next");
+  if (!pickActor) return;
+  const actor = await fromUuid(pickActor.elements.actor.value);
+
+  let backups;
+  try {
+    backups = (await signedRequest("level-ups/backups", { uuid: actor.uuid })).backups ?? [];
+  } catch (err) {
+    return ui.notifications.error(`Restore: ${err.message}`);
+  }
+  if (!backups.length) return ui.notifications.info(`${actor.name} has no level backups.`);
+
+  const pickBackup = await formDialog(`Restore ${actor.name}`,
+    `<p>Put <strong>${escapeHtml(actor.name)}</strong> back exactly as it was before one of these pulls. Everything since, play included, is lost.</p>
+     <select name="push" style="width:100%">${backups.map(b => `<option value="${b.id}">${new Date(b.at).toLocaleString()} — before level ${b.from} → ${b.to} (${escapeHtml(b.status)})</option>`).join("")}</select>`,
+    "Restore");
+  if (!pickBackup) return;
+
+  try {
+    const data = (await signedRequest("level-ups/backup-data", { push_id: Number(pickBackup.elements.push.value) })).actor;
+    const { items = [], effects = [], _id, folder, sort, ownership, _stats, ...rest } = data;
+    await actor.deleteEmbeddedDocuments("Item", actor.items.map(i => i.id));
+    await actor.deleteEmbeddedDocuments("ActiveEffect", actor.effects.map(e => e.id));
+    await actor.update(rest, { recursive: false, diff: false });
+    await actor.createEmbeddedDocuments("Item", items, { keepId: true });
+    if (effects.length) await actor.createEmbeddedDocuments("ActiveEffect", effects, { keepId: true });
+    ui.notifications.info(`${actor.name} is back as it was before that pull.`);
+  } catch (err) {
+    console.error(`[${MODULE_ID}]`, err);
+    ui.notifications.error(`Restore failed: ${err.message}`);
+  }
+}
+
 Hooks.once("ready", () => {
   log(`ready v${game.modules.get(MODULE_ID)?.version ?? "?"}`);
   globalThis.dmSync = {
     fullSync,
     attackMessage,
     attack,
+    pullLevels,
+    restoreLevelBackup,
   };
 });
