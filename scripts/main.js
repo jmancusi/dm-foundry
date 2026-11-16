@@ -40,6 +40,12 @@ async function hmacSha256Hex(secret, message) {
     .join("");
 }
 
+// dnd5e keeps trait lists (languages, weapon/armour proficiencies, weapon masteries) as Sets,
+// and JSON.stringify writes a Set as {} — so they reached Laravel empty. Send them as arrays.
+function toJson(body) {
+  return JSON.stringify(body, (key, value) => (value instanceof Set ? [...value] : value));
+}
+
 // IMPORTANT: callers MUST NOT await this. It's fire-and-forget. See CLAUDE.md §0.
 async function post(event, body) {
   if (!setting(S.enabled)) return;
@@ -54,7 +60,7 @@ async function post(event, body) {
   }
 
   const ts   = Math.floor(Date.now() / 1000);
-  const json = JSON.stringify(body);
+  const json = toJson(body);
   const hmac = await hmacSha256Hex(secret, `${ts}.${json}`);
 
   try {
@@ -88,7 +94,7 @@ async function signedRequest(event, body) {
   }
 
   const ts   = Math.floor(Date.now() / 1000);
-  const json = JSON.stringify(body);
+  const json = toJson(body);
   const hmac = await hmacSha256Hex(secret, `${ts}.${json}`);
   const res  = await fetch(`${endpoint}/${event}`, {
     method: "POST",
@@ -121,6 +127,7 @@ function actorPayload(a) {
       skills:     a.system?.skills,
       details:    a.system?.details,
       traits:     a.system?.traits,
+      tools:      a.system?.tools,
       spells:     a.system?.spells,
       currency:   a.system?.currency,
     },
@@ -328,15 +335,34 @@ Hooks.on("preUpdateActor", (actor) => {
   }
 });
 
-Hooks.on("createActor", (a) => {
-  if (!shouldSyncActor(a)) return;
-  post("actor", actorPayload(a));
-});
+// Actor syncs are coalesced per actor: a flurry of changes (an attack spending ammo, HP, a
+// condition) becomes one POST about two seconds after the last of them, and the payload is
+// built then, not inside the hook. CLAUDE.md §0.
+const ACTOR_SYNC_DELAY_MS = 2000;
+const actorSyncTimers = new Map();
+
+function queueActorSync(actor) {
+  if (!actor || !shouldSyncActor(actor)) return;
+  const key = actor.uuid;
+  clearTimeout(actorSyncTimers.get(key));
+  actorSyncTimers.set(key, setTimeout(() => {
+    actorSyncTimers.delete(key);
+    post("actor", actorPayload(actor));
+  }, ACTOR_SYNC_DELAY_MS));
+}
+
+Hooks.on("createActor", (a) => queueActorSync(a));
+
+// Gear changes on a character — equipping, picking up, using up, dropping — touch only its
+// embedded items, which updateActor never sees. Sync the owning actor (debounced as above).
+for (const hook of ["createItem", "updateItem", "deleteItem"]) {
+  Hooks.on(hook, (item) => {
+    if (item?.parent?.documentName === "Actor") queueActorSync(item.parent);
+  });
+}
 
 Hooks.on("updateActor", (a, change) => {
-  if (shouldSyncActor(a)) {
-    post("actor", actorPayload(a));
-  }
+  queueActorSync(a);
 
   // HP delta → combat damage / healing event when a combat is active.
   const newHp = change?.system?.attributes?.hp?.value;
@@ -411,6 +437,9 @@ Hooks.on("updateActor", (a, change) => {
 
 Hooks.on("deleteActor", (a) => {
   if (!shouldSyncActor(a)) return;
+  // A sync still waiting for this actor would bring it back.
+  clearTimeout(actorSyncTimers.get(a.uuid));
+  actorSyncTimers.delete(a.uuid);
   post("actor", { uuid: a.uuid, type: a.type, deleted: true });
 });
 

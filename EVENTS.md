@@ -55,8 +55,9 @@ In source order (`scripts/main.js`). The `Posts?` column flags which hooks actua
 | `init` | No | Registers settings. |
 | `ready` | No | Logs version, exposes `globalThis.dmSync` (`fullSync`, `attackMessage`, `attack`, `pullLevels`, `restoreLevelBackup`). |
 | `preUpdateActor` | No | Stashes old HP into a module-local `Map` so `updateActor` can compute a delta. |
-| `createActor` | Yes | `POST /actor` with full actor payload (subject to filter). |
-| `updateActor` | Yes | `POST /actor` with full actor payload (subject to filter). On HP delta during active combat, also `POST /combat` with `event=damage` or `event=healing`. |
+| `createActor` | Yes | `POST /actor` with full actor payload (subject to filter), debounced per actor (v0.5.1+, see below). |
+| `updateActor` | Yes | `POST /actor` with full actor payload (subject to filter), debounced per actor. On HP delta during active combat, also `POST /combat` with `event=damage` or `event=healing` (not debounced). |
+| `createItem` / `updateItem` / `deleteItem` | Yes (v0.5.1+) | When the item belongs to an actor: that actor's `POST /actor`, debounced per actor. Equipping, picking up, using up or dropping gear only touches embedded items, which `updateActor` never sees. |
 | `deleteActor` | Yes | `POST /actor` with `{ uuid, type, deleted: true }` (subject to filter). |
 | `createJournalEntry` | Yes | `POST /journal` with full journal + pages. |
 | `updateJournalEntry` | Yes | `POST /journal` with full journal + pages. |
@@ -84,7 +85,17 @@ Lives in `shouldSyncActor()`:
 
 ### Actor payload (`POST /actor`)
 
-Built by `actorPayload()`. Sent on create/update.
+Built by `actorPayload()`. Sent on create/update, and when one of the actor's items changes.
+
+**Debounced (v0.5.1+).** Actor syncs are coalesced per actor uuid: each change restarts a 2-second
+timer, and the payload is built and sent when it runs out. A burst (an attack spending ammo, HP, a
+condition) becomes one POST. `deleteActor` cancels a pending one.
+
+**Sets (v0.5.1+).** Every POST is serialised with a replacer that writes a `Set` as an array.
+dnd5e keeps `traits.languages.value`, `traits.weaponProf.value`, `traits.weaponProf.mastery.value`,
+`traits.armorProf.value` and similar as Sets. Before 0.5.1 they arrived as empty lists; only the
+derived `labels` survived. Item `system` data was always fine, because a DataModel serialises
+itself.
 
 ```json
 {
@@ -98,6 +109,7 @@ Built by `actorPayload()`. Sent on create/update.
     "skills":     { "acr": {...}, "...": "..." },
     "details":    { "biography": {...}, "race": "Half-elf", "...": "..." },
     "traits":     { "size": "med", "languages": {...}, "...": "..." },
+    "tools":      { "thief": { "value": 1, "ability": "dex", "...": "..." }, "...": "..." },
     "spells":     { "spell1": { "value": 3, "max": 4 }, "...": "..." },
     "currency":   { "gp": 45, "sp": 12, "...": "..." }
   },
@@ -114,6 +126,7 @@ Built by `actorPayload()`. Sent on create/update.
 ```
 
 v0.5.0+ also sends `"flags": {"dm-sync": {"build_id": 12}}` — set on actors imported from the character builder, `null` otherwise.
+v0.5.1+ adds `system.tools` (tool proficiencies, keyed by the tool's base item id).
 
 
 The `system.*` keys passed through are the full dnd5e schema unchanged — useful for any future feature that wants more detail without a module bump.
